@@ -564,7 +564,7 @@ if data:
                     addr_results = run_address_task(client, data, model)
                     elapsed1 = time.time() - t0
                     results["addresses"] = addr_results
-                    s.update(label=f"Addresses done ({elapsed1:.1f}s)", state="complete")
+                    s.update(label=f"Addresses done ({elapsed1:.1f}s)", state="complete", expanded=True)
                     st.metric("Records processed", len(addr_results))
                 except Exception as e:
                     s.update(label="Address task failed", state="error")
@@ -577,7 +577,7 @@ if data:
                     class_results = run_classification_task(client, data, model)
                     elapsed2 = time.time() - t0
                     results["classifications"] = class_results
-                    s.update(label=f"Classification done ({elapsed2:.1f}s)", state="complete")
+                    s.update(label=f"Classification done ({elapsed2:.1f}s)", state="complete", expanded=True)
                     st.metric("Codes decoded", len(data))
                 except Exception as e:
                     s.update(label="Classification failed", state="error")
@@ -590,7 +590,7 @@ if data:
                     quality_results = run_quality_task(client, data, model)
                     elapsed3 = time.time() - t0
                     results["quality"] = quality_results
-                    s.update(label=f"Quality audit done ({elapsed3:.1f}s)", state="complete")
+                    s.update(label=f"Quality audit done ({elapsed3:.1f}s)", state="complete", expanded=True)
                     st.metric("Issues found", len(quality_results))
                 except Exception as e:
                     s.update(label="Quality audit failed", state="error")
