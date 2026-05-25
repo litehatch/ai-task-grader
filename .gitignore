@@ -1,0 +1,8 @@
+.api_key
+.claude/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
+.venv/
+venv/

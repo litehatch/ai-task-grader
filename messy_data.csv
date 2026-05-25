@@ -1,0 +1,31 @@
+id,raw_address,remarks,source
+1,"123 Main St, Apt 4B, Austin TX 78701","Beautiful 3bd/2ba home, renovated kitchen, hardwood floors throughout. No HOA. Built 2005.",MLS_A
+2,"123 main street #4B austin texas 78701","Gorgeous 3 bed 2 bath, kitchen recently updated, hardwood flrs. No HOA fees. Yr built: 2005",MLS_B
+3,"456 Oak Avenue, Suite 100, Denver, CO 80202","Spacious 4BR/3BA colonial on 0.5 acres. HOA $250/mo. Pool and 2-car garage. Built 1998.",MLS_A
+4,"456 oak ave ste 100 denver colorado","4 bedroom 3 bathroom colonial style, half acre lot, monthly HOA 250, pool, 2 car gar, built 1998",MLS_C
+5,"789 Elm Boulevard, Nashville, TN 37203","Charming 2br/1ba bungalow, original hardwood, fenced yard, no HOA, built 1955, needs TLC",MLS_A
+6,"789 Elm Blvd Nashville Tennessee 37203","2 bed 1 bath bungalow w/ hardwood floors, fenced backyard, no homeowners assoc. 1955 build.",MLS_B
+7,"1010 Pine Road, Portland, OR 97201","Stunning 5bd/4ba modern build, smart home features, solar panels. HOA $175/month. New construction 2024.",MLS_A
+8,"1010 Pine Rd, Portland Oregon 97201","5 bedroom 4 bath modern w/ smart home tech, solar, HOA 175/mo, brand new 2024 construction",MLS_D
+9,"2020 Maple Drive, Chicago, IL 60601","Cozy 1BR/1BA condo, 8th floor, city views, doorman bldg. HOA $450/mo includes utilities. Built 2010.",MLS_A
+10,"2020 Maple Dr Chicago Illinois 60601","1 bed 1 bath condo on 8th fl, great city views, doorman building, HOA 450 monthly w/ utilities incl. Yr 2010",MLS_B
+11,"3030 Cedar Lane, Miami, FL 33101","Luxury 4br/3.5ba waterfront home, private dock, impact windows. HOA $600/mo. Built 2018.",MLS_A
+12,"3030 Cedar Ln Miami Florida","4 bed 3.5 bath waterfront w/ dock, hurricane windows, 600/mo HOA, 2018 build",MLS_C
+13,"4040 Birch Street, Seattle, WA 98101","Updated 3BR/2BA townhome, rooftop deck, EV charger, no HOA. Built 2020. Walk score 95.",MLS_A
+14,"4040 Birch St., Seattle, Washington 98101","3 bedroom 2 bath townhouse, rooftop deck, electric vehicle charger, walk score 95, no HOA, built 2020",MLS_B
+15,"5050 Walnut Circle, Phoenix, AZ 85001","Ranch style 3bd/2ba, pool, RV gate, desert landscaping. HOA $85/mo. Built 1992. Recently re-roofed.",MLS_A
+16,"5050 walnut cir. phoenix az 85001","3 bed 2 bath ranch, pool, rv parking, desert landscape, HOA 85, 1992, new roof",MLS_D
+17,"6060 Spruce Way, Boston, MA 02101","Historic 2BR/1.5BA brownstone, original moldings, private garden. No HOA. Built 1890. Updated plumbing.",MLS_A
+18,"6060 Spruce Wy, Boston Massachusetts 02101","2 bed 1.5 bath brownstone, historic details, pvt garden, no HOA, c.1890, plumbing updated",MLS_B
+19,"7070 Willow Place, San Francisco, CA 94102","Modern 2bd/2ba flat, in-unit W/D, 1 parking spot. HOA $350/mo. Built 2015. Pet friendly.",MLS_A
+20,"7070 willow pl san francisco ca 94102","2 bed 2 bath flat, washer dryer in unit, 1 pkg space, HOA 350, 2015, pets OK",MLS_C
+21,"8080 Aspen Court, Raleigh, NC 27601","New construction 4BR/3BA, open floor plan, quartz counters, smart thermostat. No HOA. 2025 build.",MLS_A
+22,"8080 Aspen Ct Raleigh North Carolina","4 bedroom 3 bath new build 2025, open concept, quartz countertops, smart thermostat, no HOA",MLS_B
+23,"9090 Hickory Lane, Austin, TX 78702","Investment property - duplex, 2BR/1BA each unit, fully leased. HOA $100/mo. Built 1975. Cash flow positive.",MLS_A
+24,"9090 Hickory Ln Austin Texas 78702","duplex 2bd/1ba per unit, both units rented, HOA 100/month, built 1975, positive cash flow",MLS_D
+25,"1111 Magnolia Blvd, Los Angeles, CA 90001","Fixer upper 3br/1ba, large lot 7500sqft, detached garage, no HOA, built 1948, estate sale",MLS_A
+26,"1111 Magnolia Boulevard Los Angeles California 90001","3 bed 1 bath fixer, 7500 sf lot, det garage, no HOA, 1948, estate sale",MLS_C
+27,"2222 Cypress Ave, Minneapolis, MN 55401","Charming 4bd/2ba craftsman, updated electrical, finished basement, 2-car garage, no HOA. Built 1935.",MLS_A
+28,"2222 Cypress Avenue Minneapolis Minnesota 55401","4 bed 2 bath craftsman style, electrical updated, finished bsmt, 2 car garage, no HOA, yr 1935",MLS_B
+29,"3333 Redwood Dr, Atlanta, GA 30301","Sleek 3BR/2.5BA townhome, rooftop terrace, EV ready. HOA $225/mo. Built 2022. LEED certified.",MLS_A
+30,"3333 redwood drive atlanta ga 30301","3 bed 2.5 bath townhome, rooftop terrace, ev charger ready, HOA 225, 2022, LEED cert",MLS_D

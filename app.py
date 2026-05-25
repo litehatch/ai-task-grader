@@ -1,0 +1,788 @@
+import streamlit as st
+import json
+import urllib.request
+import urllib.parse
+import time
+import os
+import csv
+import io
+
+try:
+    import anthropic
+except ImportError:
+    st.error("Run: pip install anthropic")
+    st.stop()
+
+st.set_page_config(page_title="AI Data Cleanup Evaluation", layout="wide")
+
+st.markdown("""
+<style>
+    .block-container { max-width: 1100px; }
+    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+    div[data-testid="stMetric"] { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("AI Data Cleanup Evaluation")
+st.caption("Measure AI accuracy on real property records — task by task, backed by numbers.")
+
+KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".api_key")
+
+def load_saved_key():
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE) as f:
+            return f.read().strip()
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+def save_key(key):
+    with open(KEY_FILE, "w") as f:
+        f.write(key)
+
+# ── Sidebar ──
+with st.sidebar:
+    st.header("Configuration")
+    saved_key = load_saved_key()
+    api_key = st.text_input("Anthropic API Key", type="password", value=saved_key)
+    if api_key and api_key != saved_key:
+        save_key(api_key)
+    model = st.selectbox("Model", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
+    st.divider()
+
+    st.header("Data Source")
+    source = st.radio("Choose source", ["Toronto (Open Data)", "NYC (PLUTO API)", "Vancouver (Open Data)", "Upload CSV"])
+
+    if source == "NYC (PLUTO API)":
+        st.subheader("NYC Filters")
+        borough = st.selectbox("Borough", ["Any", "Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"])
+        boro_map = {"Manhattan": "MN", "Brooklyn": "BK", "Queens": "QN", "Bronx": "BX", "Staten Island": "SI"}
+        zip_filter = st.text_input("ZIP Code (optional)", placeholder="e.g. 10013")
+        street_filter = st.text_input("Street name (optional)", placeholder="e.g. BROADWAY")
+        num_records = st.slider("Records to fetch", 10, 200, 50)
+
+    elif source == "Vancouver (Open Data)":
+        st.subheader("Vancouver Filters")
+        van_neighbourhoods = {
+            "Any": None,
+            "Downtown": "029",
+            "West End": "030",
+            "Kitsilano": "004",
+            "Mount Pleasant": "010",
+            "Grandview-Woodland": "009",
+            "Hastings-Sunrise": "008",
+            "Strathcona": "028",
+            "Fairview": "011",
+            "Kerrisdale": "005",
+            "Dunbar-Southlands": "003",
+            "Shaughnessy": "006",
+            "South Cambie": "012",
+            "Riley Park": "013",
+            "Kensington-Cedar Cottage": "014",
+            "Renfrew-Collingwood": "015",
+            "Marpole": "016",
+            "Oakridge": "017",
+            "Sunset": "018",
+            "Victoria-Fraserview": "019",
+            "Killarney": "020",
+            "West Point Grey": "002",
+            "Arbutus Ridge": "001",
+        }
+        van_neighbourhood = st.selectbox("Neighbourhood", list(van_neighbourhoods.keys()))
+        van_street = st.text_input("Street name (optional)", placeholder="e.g. ROBSON", key="van_street")
+        van_postal = st.text_input("Postal code prefix (optional)", placeholder="e.g. V6B", key="van_postal")
+        num_records = st.slider("Records to fetch", 10, 200, 50, key="van_num")
+
+    elif source == "Toronto (Open Data)":
+        st.subheader("Toronto Filters")
+        tor_wards = {
+            "Any": None,
+            "1 — Etobicoke North": "01", "2 — Etobicoke Centre": "02", "3 — Etobicoke-Lakeshore": "03",
+            "4 — Parkdale-High Park": "04", "5 — York South-Weston": "05", "6 — York Centre": "06",
+            "7 — Humber River-Black Creek": "07", "8 — Eglinton-Lawrence": "08", "9 — Davenport": "09",
+            "10 — Spadina-Fort York": "10", "11 — University-Rosedale": "11", "12 — Toronto-St. Paul's": "12",
+            "13 — Toronto Centre": "13", "14 — Toronto-Danforth": "14", "15 — Don Valley West": "15",
+            "16 — Don Valley East": "16", "17 — Don Valley North": "17", "18 — Willowdale": "18",
+            "19 — Beaches-East York": "19", "20 — Scarborough Southwest": "20", "21 — Scarborough Centre": "21",
+            "22 — Scarborough-Agincourt": "22", "23 — Scarborough North": "23",
+            "24 — Scarborough-Guildwood": "24", "25 — Scarborough-Rouge Park": "25",
+        }
+        tor_ward = st.selectbox("Ward", list(tor_wards.keys()), key="tor_ward_sel")
+        tor_street = st.text_input("Street name (optional)", placeholder="e.g. DUNDAS", key="tor_street")
+        tor_fsa = st.text_input("Postal FSA prefix (optional)", placeholder="e.g. M5V", key="tor_fsa")
+        num_records = st.slider("Records to fetch", 10, 200, 50, key="tor_num")
+
+    else:
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+        st.caption("CSV must have columns: address, and optionally: zipcode, ownername, bldgclass, yearbuilt")
+
+# ── Data fetching ──
+def fetch_nyc_data(borough, zip_filter, street_filter, limit):
+    conditions = ["address IS NOT NULL"]
+    if borough != "Any":
+        conditions.append(f"borough='{boro_map[borough]}'")
+    if zip_filter:
+        conditions.append(f"zipcode='{zip_filter}'")
+    if street_filter:
+        conditions.append(f"address like '%25{street_filter.upper()}%25'")
+    where = " AND ".join(conditions)
+    params = urllib.parse.urlencode({"$limit": limit, "$where": where, "$order": "bbl", "$offset": 0})
+    url = f"https://data.cityofnewyork.us/resource/64uk-42ks.json?{params}"
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=30) as resp:
+        return json.loads(resp.read())
+
+def fetch_vancouver_data(neighbourhood, street, postal, limit):
+    conditions = ["from_civic_number IS NOT NULL"]
+    code = van_neighbourhoods.get(neighbourhood)
+    if code:
+        conditions.append(f"neighbourhood_code='{code}'")
+    if street:
+        conditions.append(f"street_name LIKE '*{street.upper()}*'")
+    if postal:
+        conditions.append(f"property_postal_code LIKE '{postal.upper()}*'")
+    where = " AND ".join(conditions)
+    params = urllib.parse.urlencode({"limit": limit, "where": where})
+    url = f"https://opendata.vancouver.ca/api/explore/v2.1/catalog/datasets/property-tax-report/records?{params}"
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=30) as resp:
+        raw = json.loads(resp.read())
+
+    records = []
+    for r in raw.get("results", []):
+        civic = r.get("from_civic_number", "")
+        street_name = r.get("street_name", "")
+        address = f"{civic} {street_name}".strip() if civic else street_name
+        records.append({
+            "address": address,
+            "zipcode": r.get("property_postal_code", ""),
+            "ownername": "",
+            "bldgclass": r.get("zoning_classification", ""),
+            "yearbuilt": r.get("year_built", ""),
+            "legal_type": r.get("legal_type", ""),
+            "zoning_district": r.get("zoning_district", ""),
+            "current_land_value": r.get("current_land_value", ""),
+            "current_improvement_value": r.get("current_improvement_value", ""),
+            "tax_levy": r.get("tax_levy", ""),
+            "neighbourhood_code": r.get("neighbourhood_code", ""),
+            "narrative_legal": " ".join(filter(None, [
+                r.get("narrative_legal_line1", ""),
+                r.get("narrative_legal_line2", ""),
+                r.get("narrative_legal_line3", ""),
+            ])),
+            "_source": "vancouver",
+        })
+    return records
+
+TORONTO_RESOURCE_ID = "3ad76a8c-0518-4df2-b94e-8c747d62f8c1"
+
+def fetch_toronto_data(ward_label, street, fsa, limit):
+    filters = {}
+    ward_code = tor_wards.get(ward_label)
+    if ward_code:
+        filters["WARD"] = ward_code
+    fetch_limit = 4000 if (street or fsa) else limit
+    params = {
+        "resource_id": TORONTO_RESOURCE_ID,
+        "limit": fetch_limit,
+    }
+    if filters:
+        params["filters"] = json.dumps(filters)
+    url = "https://ckan0.cf.opendata.inter.prod-toronto.ca/api/3/action/datastore_search?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=30) as resp:
+        raw = json.loads(resp.read())
+
+    records = []
+    street_upper = street.upper() if street else None
+    fsa_upper = fsa.upper() if fsa else None
+    for r in raw.get("result", {}).get("records", []):
+        if len(records) >= limit:
+            break
+        pcode = (r.get("PCODE") or "").strip()
+        if fsa_upper and not pcode.upper().startswith(fsa_upper):
+            continue
+        address = " ".join((r.get("SITE_ADDRESS") or "").split())
+        if street_upper and street_upper not in address.upper():
+            continue
+        records.append({
+            "address": address,
+            "zipcode": pcode,
+            "ownername": r.get("PROP_MANAGEMENT_COMPANY_NAME", ""),
+            "bldgclass": r.get("PROPERTY_TYPE", ""),
+            "yearbuilt": r.get("YEAR_BUILT", ""),
+            "year_registered": r.get("YEAR_REGISTERED", ""),
+            "confirmed_units": r.get("CONFIRMED_UNITS", ""),
+            "no_of_units": r.get("NO_OF_UNITS", ""),
+            "confirmed_storeys": r.get("CONFIRMED_STOREYS", ""),
+            "no_of_storeys": r.get("NO_OF_STOREYS", ""),
+            "ward": r.get("WARD", ""),
+            "heating_type": r.get("HEATING_TYPE", ""),
+            "parking_type": r.get("PARKING_TYPE", ""),
+            "amenities": r.get("AMENITIES_AVAILABLE", ""),
+            "_source": "toronto",
+        })
+    return records
+
+def parse_csv_upload(uploaded_file):
+    content = uploaded_file.read().decode("utf-8")
+    return list(csv.DictReader(io.StringIO(content)))
+
+# ── LLM calls ──
+def call_claude(client, prompt, model_name, max_tokens=4096):
+    resp = client.messages.create(
+        model=model_name, max_tokens=max_tokens,
+        system="You are a real estate data processing assistant. Return ONLY valid JSON, no explanation or markdown.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.content[0].text
+
+def parse_json_response(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if text.startswith("["):
+            last_brace = text.rfind("}")
+            if last_brace > 0:
+                return json.loads(text[:last_brace+1] + "]")
+        elif text.startswith("{"):
+            last_brace = text.rfind("}")
+            if last_brace > 0:
+                return json.loads(text[:last_brace+1])
+        raise
+
+# ── Task prompts (adaptive to city) ──
+def detect_city(records):
+    for r in records:
+        src = r.get("_source")
+        if src == "vancouver":
+            return "vancouver"
+        if src == "toronto":
+            return "toronto"
+        zc = (r.get("zipcode") or "").strip().upper()
+        if zc.startswith("V"):
+            return "vancouver"
+        if zc.startswith("M"):
+            return "toronto"
+    return "nyc"
+
+def run_address_task(client, records, model_name):
+    city = detect_city(records)
+
+    if city == "toronto":
+        batch = [{"id": i+1, "raw_address": r.get("address", ""), "fsa": r.get("zipcode", ""), "ward": r.get("ward", "")}
+                 for i, r in enumerate(records)]
+        prompt = f"""Parse and standardize each Toronto address into structured components.
+
+Rules:
+- Convert ALL CAPS to proper Title Case
+- Collapse double/triple spaces in the raw address
+- Abbreviate street types: Street→St, Avenue→Ave, Boulevard→Blvd, Place→Pl, Lane→Ln, Court→Ct, Road→Rd, Drive→Dr, Crescent→Cres, Terrace→Ter, Parkway→Pkwy
+- Abbreviate directionals: West→W, East→E, North→N, South→S (these appear AFTER the street name in Toronto, e.g. "The Donway E")
+- City is always Toronto, province is always ON
+- The "fsa" input is the first half of the postal code (Forward Sortation Area, 3 chars). Keep it in the output; do not invent a full postal code
+- If a unit number is embedded (e.g. "12-100 King St"), split it into unit and street_number
+- Note every change you made from the original
+
+Input records:
+{json.dumps(batch, indent=2)}
+
+Return JSON array:
+[{{"id": 1, "unit": "", "street_number": "12", "street_name": "The Donway E", "city": "Toronto", "province": "ON", "fsa": "M3C", "standardized": "12 The Donway E, Toronto, ON M3C", "changes": ["Title-cased street name", "Collapsed double spaces"]}}]"""
+    elif city == "vancouver":
+        batch = [{"id": i+1, "raw_address": r.get("address", ""), "postal_code": r.get("zipcode", "")}
+                 for i, r in enumerate(records)]
+        prompt = f"""Parse and standardize each Vancouver address into structured components.
+
+Rules:
+- Convert ALL CAPS to proper Title Case
+- Abbreviate street types: Street→St, Avenue→Ave, Boulevard→Blvd, Place→Pl, Lane→Ln, Court→Ct, Road→Rd, Drive→Dr, Crescent→Cres, Mews→Mews
+- Abbreviate directionals: West→W, East→E, North→N, South→S
+- City is always Vancouver, province is always BC
+- If a unit/townhouse prefix exists (e.g. "TH116"), split it into unit and street_number
+- Note every change you made from the original
+
+Input records:
+{json.dumps(batch, indent=2)}
+
+Return JSON array:
+[{{"id": 1, "unit": "", "street_number": "605", "street_name": "Hamilton St", "city": "Vancouver", "province": "BC", "postal_code": "V6B 5W4", "standardized": "605 Hamilton St, Vancouver, BC V6B 5W4", "changes": ["Title-cased street name", "Abbreviated Street→St"]}}]"""
+    else:
+        batch = [{"id": i+1, "raw_address": r.get("address", ""), "borough": r.get("borough", ""),
+                  "zipcode": r.get("zipcode", "")} for i, r in enumerate(records)]
+        prompt = f"""Parse and standardize each NYC address into structured components.
+
+Rules:
+- Convert ALL CAPS to proper Title Case
+- Abbreviate street types: Street→St, Avenue→Ave, Boulevard→Blvd, Place→Pl, Lane→Ln, Court→Ct, Road→Rd
+- Abbreviate directionals: West→W, East→E, North→N, South→S
+- Borough codes: MN=New York, BK=Brooklyn, QN=Queens, BX=Bronx, SI=Staten Island
+- State is always NY
+- If a unit/apt number is embedded, split it out
+- Note every change you made from the original
+
+Input records:
+{json.dumps(batch, indent=2)}
+
+Return JSON array:
+[{{"id": 1, "unit": "", "street_number": "325", "street_name": "Greenwich St", "city": "New York", "state": "NY", "zipcode": "10013", "standardized": "325 Greenwich St, New York, NY 10013", "changes": ["Title-cased street name", "Abbreviated Street→St"]}}]"""
+
+    raw = call_claude(client, prompt, model_name, max_tokens=8192)
+    parsed = parse_json_response(raw)
+    return {r["id"]: r for r in parsed}
+
+def run_classification_task(client, records, model_name):
+    city = detect_city(records)
+
+    if city == "toronto":
+        property_types = sorted(set(r.get("bldgclass", "") for r in records if r.get("bldgclass")))
+        heating_types = sorted(set(r.get("heating_type", "") for r in records if r.get("heating_type")))
+        parking_types = sorted(set(r.get("parking_type", "") for r in records if r.get("parking_type")))
+        prompt = f"""Decode these Toronto apartment-building classifications into human-readable descriptions.
+
+These come from the City of Toronto's RentSafeTO Apartment Building Registration dataset.
+
+Property types: {json.dumps(property_types)}
+Heating types: {json.dumps(heating_types)}
+Parking types: {json.dumps(parking_types)}
+
+Return a JSON object with three keys:
+{{
+  "property_types": {{"PRIVATE": "description...", "TCHC": "Toronto Community Housing Corporation, ..."}},
+  "heating_types": {{"HOT WATER": "description...", "FORCED AIR": "description..."}},
+  "parking_types": {{"UNDERGROUND": "description...", "SURFACE": "description..."}}
+}}"""
+    elif city == "vancouver":
+        codes = list(set(r.get("bldgclass", "") for r in records if r.get("bldgclass")))
+        zoning_districts = list(set(r.get("zoning_district", "") for r in records if r.get("zoning_district")))
+        legal_types = list(set(r.get("legal_type", "") for r in records if r.get("legal_type")))
+        prompt = f"""Decode these Vancouver property classifications into human-readable descriptions.
+
+Zoning classifications: {json.dumps(codes)}
+Zoning district codes: {json.dumps(zoning_districts)}
+Legal types: {json.dumps(legal_types)}
+
+Return a JSON object with three keys:
+{{
+  "zoning_classifications": {{"Comprehensive Development": "description..."}},
+  "zoning_districts": {{"DD": "description...", "CD-1 (266)": "description..."}},
+  "legal_types": {{"STRATA": "description...", "LAND": "description..."}}
+}}"""
+    else:
+        codes = list(set(r.get("bldgclass", "") for r in records if r.get("bldgclass")))
+        prompt = f"""Decode these NYC Department of Finance building class codes into human-readable descriptions.
+
+Codes to decode: {json.dumps(codes)}
+
+Return JSON object mapping each code to its description:
+{{"D2": "Elevator Apartment, ...", "A7": "One Family, ..."}}"""
+
+    raw = call_claude(client, prompt, model_name)
+    return parse_json_response(raw)
+
+def run_verdict_task(client, results, city, num_records, model_name):
+    summary = {
+        "city": city,
+        "records_evaluated": num_records,
+        "address_count": len(results.get("addresses", {})),
+        "classification_result": results.get("classifications", {}),
+        "quality_issues": [
+            {"severity": q.get("severity"), "title": q.get("title"), "affected_rows": q.get("affected_rows", [])}
+            for q in results.get("quality", [])
+        ],
+        "quality_issue_count": len(results.get("quality", [])),
+        "high_severity_count": sum(1 for q in results.get("quality", []) if q.get("severity") == "high"),
+        "medium_severity_count": sum(1 for q in results.get("quality", []) if q.get("severity") == "medium"),
+        "low_severity_count": sum(1 for q in results.get("quality", []) if q.get("severity") == "low"),
+    }
+
+    city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
+    class_task_name = {"vancouver": "Zoning Classification", "toronto": "Building Type Classification"}.get(city, "Building Classification")
+    prompt = f"""You just evaluated {num_records} real {city_label} property records with AI across three tasks. Here are the results:
+
+{json.dumps(summary, indent=2)}
+
+Based on these actual results, produce a verdict as a JSON object with this structure:
+{{
+  "tasks": [
+    {{
+      "name": "Address Standardization",
+      "recommendation": "short recommendation (3-6 words)",
+      "rationale": "one sentence based on what you actually observed"
+    }},
+    {{
+      "name": "{class_task_name}",
+      "recommendation": "short recommendation (3-6 words)",
+      "rationale": "one sentence based on what you actually observed"
+    }},
+    {{
+      "name": "Data Quality Audit",
+      "recommendation": "short recommendation (3-6 words)",
+      "rationale": "one sentence based on what you actually observed"
+    }}
+  ],
+  "bottom_line": "2-3 sentence overall assessment specific to this dataset — what worked, what didn't, and what a production pipeline should do differently. Reference specific findings from the data."
+}}"""
+
+    raw = call_claude(client, prompt, model_name)
+    return parse_json_response(raw)
+
+def run_quality_task(client, records, model_name):
+    city = detect_city(records)
+
+    if city == "toronto":
+        batch = [{"id": i+1, "address": r.get("address", ""), "fsa": r.get("zipcode", ""),
+                  "ward": r.get("ward", ""), "property_type": r.get("bldgclass", ""),
+                  "yearbuilt": r.get("yearbuilt", ""), "year_registered": r.get("year_registered", ""),
+                  "confirmed_units": r.get("confirmed_units", ""), "no_of_units": r.get("no_of_units", ""),
+                  "confirmed_storeys": r.get("confirmed_storeys", ""), "no_of_storeys": r.get("no_of_storeys", ""),
+                  "heating_type": r.get("heating_type", ""), "management_company": r.get("ownername", "")}
+                 for i, r in enumerate(records)]
+    elif city == "vancouver":
+        batch = [{"id": i+1, "address": r.get("address", ""), "postal_code": r.get("zipcode", ""),
+                  "zoning": r.get("bldgclass", ""), "zoning_district": r.get("zoning_district", ""),
+                  "legal_type": r.get("legal_type", ""), "yearbuilt": r.get("yearbuilt", ""),
+                  "land_value": r.get("current_land_value", ""),
+                  "improvement_value": r.get("current_improvement_value", ""),
+                  "tax_levy": r.get("tax_levy", ""),
+                  "legal_description": r.get("narrative_legal", "")}
+                 for i, r in enumerate(records)]
+    else:
+        batch = [{"id": i+1, "address": r.get("address", ""), "zipcode": r.get("zipcode", ""),
+                  "ownername": r.get("ownername", ""), "bldgclass": r.get("bldgclass", ""),
+                  "yearbuilt": r.get("yearbuilt", ""), "unitsres": r.get("unitsres", ""),
+                  "unitstotal": r.get("unitstotal", ""), "assesstot": r.get("assesstot", "")}
+                 for i, r in enumerate(records)]
+
+    city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
+    prompt = f"""Audit these {city_label} property records for ACTIONABLE data quality issues only.
+
+Focus on issues that would cause real problems in a production data pipeline:
+- Missing or null values in critical fields (address, assessment, year built)
+- Probable data entry errors (e.g. yearbuilt=0 or yearbuilt in the future)
+- Contradictions between fields (e.g. residential zoning with commercial use, assessed value inconsistent with property type)
+- Statistical outliers that suggest bad data (e.g. a value 10x higher/lower than similar properties in the same area)
+- {"Postal code vs address location mismatches" if city in ("vancouver", "toronto") else "ZIP code vs borough mismatches"}
+- {"Confirmed vs declared unit/storey count divergence (CONFIRMED_UNITS vs NO_OF_UNITS, CONFIRMED_STOREYS vs NO_OF_STOREYS)" if city == "toronto" else ""}
+- {"Assessment value anomalies relative to property type and neighbourhood" if city == "vancouver" else ""}
+- Duplicate address detection: when multiple records share the same street address, analyze whether they are:
+  - **Legitimate**: separate strata/condo units in the same building (different lot numbers, different assessed values, same year built) — report as low severity with an explanation
+  - **Suspicious**: truly duplicate records with identical or near-identical data across all fields — report as high severity
+  - **Contradictory**: same address but conflicting info that can't be explained by separate units (e.g. different year built, different zoning) — report as high severity
+
+DO NOT flag:
+- Truncated legal descriptions or text formatting issues — these are normal in government data exports
+- ALL CAPS text — this is standard formatting, not an error
+- Word-break artifacts or spacing in text fields
+- Minor formatting inconsistencies that don't affect data usability
+- Issues affecting the majority of records — that's a dataset characteristic, not a quality issue
+
+Only report issues where a specific record has data that is likely WRONG, not just messy.
+
+Records:
+{json.dumps(batch, indent=2)}
+
+Return JSON array of issues found:
+[{{"severity": "high|medium|low", "title": "Short description", "description": "Detailed explanation", "affected_rows": [1,2,3]}}]"""
+
+    raw = call_claude(client, prompt, model_name)
+    return parse_json_response(raw)
+
+# ── Main ──
+if not api_key:
+    st.info("Enter your Anthropic API key in the sidebar to get started.")
+    st.stop()
+
+data = None
+
+if source == "NYC (PLUTO API)":
+    if st.sidebar.button("Fetch Data", type="primary", use_container_width=True):
+        with st.spinner(f"Fetching {num_records} records from NYC PLUTO..."):
+            try:
+                data = fetch_nyc_data(borough, zip_filter, street_filter, num_records)
+                st.session_state["data"] = data
+                st.session_state["data_source"] = "nyc"
+                st.session_state["results"] = None
+            except Exception as e:
+                st.error(f"Failed to fetch: {e}")
+    if "data" in st.session_state:
+        data = st.session_state["data"]
+
+elif source == "Vancouver (Open Data)":
+    if st.sidebar.button("Fetch Data", type="primary", use_container_width=True, key="van_fetch"):
+        with st.spinner(f"Fetching {num_records} records from Vancouver Open Data..."):
+            try:
+                data = fetch_vancouver_data(van_neighbourhood, van_street, van_postal, num_records)
+                st.session_state["data"] = data
+                st.session_state["data_source"] = "vancouver"
+                st.session_state["results"] = None
+            except Exception as e:
+                st.error(f"Failed to fetch: {e}")
+    if "data" in st.session_state:
+        data = st.session_state["data"]
+
+elif source == "Toronto (Open Data)":
+    if st.sidebar.button("Fetch Data", type="primary", use_container_width=True, key="tor_fetch"):
+        with st.spinner(f"Fetching {num_records} records from Toronto Open Data..."):
+            try:
+                data = fetch_toronto_data(tor_ward, tor_street, tor_fsa, num_records)
+                st.session_state["data"] = data
+                st.session_state["data_source"] = "toronto"
+                st.session_state["results"] = None
+            except Exception as e:
+                st.error(f"Failed to fetch: {e}")
+    if "data" in st.session_state:
+        data = st.session_state["data"]
+
+else:
+    if uploaded:
+        data = parse_csv_upload(uploaded)
+        st.session_state["data"] = data
+        st.session_state["data_source"] = "csv"
+        st.session_state["results"] = None
+    elif "data" in st.session_state:
+        data = st.session_state["data"]
+
+if data:
+    src_label = st.session_state.get("data_source", "unknown").upper()
+    st.success(f"**{len(data)} records loaded** from {src_label}")
+
+    with st.expander("Preview raw data", expanded=False):
+        city = detect_city(data)
+        if city == "vancouver":
+            preview_cols = ["address", "zipcode", "legal_type", "bldgclass", "yearbuilt", "current_land_value"]
+        elif city == "toronto":
+            preview_cols = ["address", "zipcode", "ward", "bldgclass", "yearbuilt", "confirmed_units", "no_of_units"]
+        else:
+            preview_cols = ["address", "zipcode", "ownername", "bldgclass", "yearbuilt"]
+        rows = []
+        for r in data[:20]:
+            rows.append({c: r.get(c, "") for c in preview_cols})
+        st.table(rows)
+
+    if st.button("Run AI Evaluation", type="primary", use_container_width=True):
+        client = anthropic.Anthropic(api_key=api_key)
+        results = {}
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            with st.status("Task 1: Address Standardization...", expanded=True) as s:
+                t0 = time.time()
+                try:
+                    addr_results = run_address_task(client, data, model)
+                    elapsed1 = time.time() - t0
+                    results["addresses"] = addr_results
+                    s.update(label=f"Addresses done ({elapsed1:.1f}s)", state="complete")
+                    st.metric("Records processed", len(addr_results))
+                except Exception as e:
+                    s.update(label="Address task failed", state="error")
+                    st.error(str(e))
+
+        with col2:
+            with st.status("Task 2: Classification...", expanded=True) as s:
+                t0 = time.time()
+                try:
+                    class_results = run_classification_task(client, data, model)
+                    elapsed2 = time.time() - t0
+                    results["classifications"] = class_results
+                    s.update(label=f"Classification done ({elapsed2:.1f}s)", state="complete")
+                    st.metric("Codes decoded", len(data))
+                except Exception as e:
+                    s.update(label="Classification failed", state="error")
+                    st.error(str(e))
+
+        with col3:
+            with st.status("Task 3: Data Quality Audit...", expanded=True) as s:
+                t0 = time.time()
+                try:
+                    quality_results = run_quality_task(client, data, model)
+                    elapsed3 = time.time() - t0
+                    results["quality"] = quality_results
+                    s.update(label=f"Quality audit done ({elapsed3:.1f}s)", state="complete")
+                    st.metric("Issues found", len(quality_results))
+                except Exception as e:
+                    s.update(label="Quality audit failed", state="error")
+                    st.error(str(e))
+
+        if results.get("addresses") or results.get("classifications") or results.get("quality"):
+            with st.status("Generating verdict...", expanded=True) as s:
+                t0 = time.time()
+                try:
+                    verdict = run_verdict_task(client, results, detect_city(data), len(data), model)
+                    elapsed_v = time.time() - t0
+                    results["verdict"] = verdict
+                    s.update(label=f"Verdict ready ({elapsed_v:.1f}s)", state="complete")
+                except Exception as e:
+                    s.update(label="Verdict failed", state="error")
+                    st.error(str(e))
+
+        st.session_state["results"] = results
+
+    if st.session_state.get("results"):
+        results = st.session_state["results"]
+        st.divider()
+        city = detect_city(data)
+
+        tab1, tab2, tab3, tab4 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict"])
+
+        with tab1:
+            if "addresses" in results:
+                st.subheader("Address Standardization Results")
+                addr_data = results["addresses"]
+                rows = []
+                for i, r in enumerate(data):
+                    entry = addr_data.get(i+1, {})
+                    if isinstance(entry, str):
+                        entry = {"standardized": entry, "changes": []}
+                    row = {
+                        "#": i+1,
+                        "Raw": r.get("address", ""),
+                        "Standardized": entry.get("standardized", "—"),
+                        "Street #": entry.get("street_number", ""),
+                        "Street": entry.get("street_name", ""),
+                        "Unit": entry.get("unit", ""),
+                        "City": entry.get("city", ""),
+                    }
+                    if city == "vancouver":
+                        row["Prov"] = entry.get("province", "")
+                        row["Postal"] = entry.get("postal_code", r.get("zipcode", ""))
+                    elif city == "toronto":
+                        row["Prov"] = entry.get("province", "")
+                        row["FSA"] = entry.get("fsa", r.get("zipcode", ""))
+                    else:
+                        row["State"] = entry.get("state", "")
+                        row["ZIP"] = entry.get("zipcode", r.get("zipcode", ""))
+                    changes = entry.get("changes", [])
+                    row["Changes"] = "; ".join(changes) if changes else "None"
+                    rows.append(row)
+                st.dataframe(rows, use_container_width=True, height=500)
+
+        with tab2:
+            if "classifications" in results:
+                class_data = results["classifications"]
+                if city in ("vancouver", "toronto"):
+                    st.subheader("Property Type / Building Decoding" if city == "toronto" else "Zoning & Property Type Decoding")
+                    for category, mappings in class_data.items():
+                        if isinstance(mappings, dict):
+                            st.markdown(f"**{category.replace('_', ' ').title()}**")
+                            rows = [{"Code": k, "Description": v} for k, v in mappings.items()]
+                            st.dataframe(rows, use_container_width=True)
+                else:
+                    st.subheader("Building Class Decoding")
+                    rows = []
+                    seen = set()
+                    for r in data:
+                        code = r.get("bldgclass", "")
+                        if code and code not in seen:
+                            seen.add(code)
+                            rows.append({
+                                "Code": code,
+                                "AI Description": class_data.get(code, "Unknown"),
+                                "Example Address": r.get("address", "")
+                            })
+                    st.dataframe(rows, use_container_width=True)
+
+        with tab3:
+            if "quality" in results:
+                st.subheader("Data Quality Issues")
+                for issue in results["quality"]:
+                    severity = issue.get("severity", "low")
+                    icon = "🔴" if severity == "high" else "🟡" if severity == "medium" else "🔵"
+                    with st.expander(f"{icon} {issue.get('title', 'Issue')}", expanded=severity == "high"):
+                        st.write(issue.get("description", ""))
+                        affected = issue.get("affected_rows", [])
+                        if affected and data:
+                            if city == "vancouver":
+                                show_cols = ["address", "zipcode", "bldgclass", "zoning_district", "legal_type",
+                                             "yearbuilt", "current_land_value", "current_improvement_value",
+                                             "tax_levy", "narrative_legal"]
+                            elif city == "toronto":
+                                show_cols = ["address", "zipcode", "ward", "bldgclass", "yearbuilt",
+                                             "year_registered", "confirmed_units", "no_of_units",
+                                             "confirmed_storeys", "no_of_storeys", "heating_type", "ownername"]
+                            else:
+                                show_cols = ["address", "zipcode", "ownername", "bldgclass",
+                                             "yearbuilt", "unitsres", "unitstotal", "assesstot"]
+                            affected_rows = []
+                            for row_id in affected:
+                                idx = row_id - 1
+                                if 0 <= idx < len(data):
+                                    r = data[idx]
+                                    row = {"#": row_id}
+                                    for c in show_cols:
+                                        val = r.get(c, "")
+                                        if val != "":
+                                            row[c] = val
+                                    affected_rows.append(row)
+                            if affected_rows:
+                                st.dataframe(affected_rows, use_container_width=True, hide_index=True)
+
+        with tab4:
+            st.subheader("Verdict")
+            city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
+            verdict = results.get("verdict")
+            if verdict and isinstance(verdict, dict):
+                tasks = verdict.get("tasks", [])
+                if tasks:
+                    st.markdown(f"**{city_label} evaluation results ({len(data)} records):**")
+                    table_md = "| Task | Recommendation | Rationale |\n|------|---------------|----------|\n"
+                    for t in tasks:
+                        table_md += f"| **{t.get('name', '')}** | {t.get('recommendation', '')} | {t.get('rationale', '')} |\n"
+                    st.markdown(table_md)
+                bottom_line = verdict.get("bottom_line", "")
+                if bottom_line:
+                    st.info(f"**Bottom line:** {bottom_line}")
+
+                st.markdown(
+                    """
+                    <div style="
+                        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                        border-radius: 14px;
+                        padding: 32px;
+                        margin-top: 24px;
+                        box-shadow: 0 10px 30px -10px rgba(15,23,42,0.4);
+                        color: #f8fafc;
+                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                    ">
+                      <div style="display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 6px;">
+                        <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #93c5fd;">
+                          Unit economics at scale
+                        </div>
+                        <div style="font-size: 12px; color: #94a3b8;">Projected to 1,000,000 records</div>
+                      </div>
+                      <div style="font-size: 14px; color: #cbd5e1; margin-bottom: 24px; max-width: 640px; line-height: 1.5;">
+                        Accuracy means nothing without unit economics. Here's what cleanup costs at production volume — AI vs. the labor alternative.
+                      </div>
+                      <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 24px;">
+                        <div>
+                          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; color: #93c5fd;">AI pipeline</div>
+                          <div style="font-size: 38px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.1;">$300–1K</div>
+                          <div style="font-size: 13px; color: #94a3b8; margin-top: 4px;">API spend, batched</div>
+                          <div style="font-size: 12px; color: #64748b; margin-top: 6px;">8–12 hours wall time</div>
+                        </div>
+                        <div>
+                          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; color: #fcd34d;">Offshore BPO</div>
+                          <div style="font-size: 38px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.1;">~$10K</div>
+                          <div style="font-size: 13px; color: #94a3b8; margin-top: 4px;">Per-record outsourced</div>
+                          <div style="font-size: 12px; color: #64748b; margin-top: 6px;">Weeks of turnaround</div>
+                        </div>
+                        <div>
+                          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; color: #fca5a5;">Domestic analyst</div>
+                          <div style="font-size: 38px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.1;">~$500K</div>
+                          <div style="font-size: 13px; color: #94a3b8; margin-top: 4px;">In-house review</div>
+                          <div style="font-size: 12px; color: #64748b; margin-top: 6px;">Months at FTE rates</div>
+                        </div>
+                      </div>
+                      <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #334155; font-size: 14px; color: #cbd5e1; line-height: 1.55;">
+                        <strong style="color: #ffffff;">AI is 10×–500× cheaper than manual</strong> for the same volume —
+                        but only worth deploying on tasks the verdict above scores as <em style="color: #cbd5e1;">automate</em> or <em style="color: #cbd5e1;">human-in-loop</em>.
+                        That's the decision this harness exists to make.
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning("Verdict not available — run the evaluation to generate one.")
+
+elif source in ("NYC (PLUTO API)", "Vancouver (Open Data)", "Toronto (Open Data)"):
+    st.info("Click **Fetch Data** in the sidebar to load property records.")

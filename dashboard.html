@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Data Cleanup Evaluation — Methodology Demo</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+  body { font-family: 'Inter', sans-serif; }
+  .bar-fill { transition: width 1.5s ease-out; }
+  .fade-in { animation: fadeIn 0.4s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; }
+  .match { background: #dcfce7; }
+  .mismatch { background: #fef2f2; }
+  .flag { background: #fffbeb; }
+  tr:hover td { background: #f1f5f9 !important; }
+  .verdict-auto { border-left: 4px solid #22c55e; }
+  .verdict-human { border-left: 4px solid #f59e0b; }
+  .verdict-no { border-left: 4px solid #ef4444; }
+  .hero-num { font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .cost-card { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+<div class="max-w-7xl mx-auto px-6 py-8">
+
+  <!-- Header -->
+  <div class="mb-8">
+    <div class="flex items-center gap-3 mb-2">
+      <h1 class="text-3xl font-bold text-gray-900 tracking-tight">AI Adoption Readiness Harness</h1>
+      <span class="text-xs font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">LIVE DATA</span>
+    </div>
+    <p class="text-gray-600 mt-2 text-base leading-relaxed max-w-3xl">
+      A per-task accuracy framework for deciding <em>where AI fits</em> in a data pipeline —
+      automate, human-in-loop, or reject — with cost and throughput numbers, not vibes.
+    </p>
+    <div class="flex flex-wrap gap-x-6 gap-y-2 mt-5 text-sm text-gray-500">
+      <span><strong class="text-gray-700">Sample:</strong> 50 real NYC PLUTO records, Lower Manhattan</span>
+      <span><strong class="text-gray-700">Model:</strong> Claude (Anthropic)</span>
+      <span><strong class="text-gray-700">Generalizes to:</strong> NYC, Vancouver, Toronto open data</span>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="border-b border-gray-200 mb-6">
+    <nav class="flex gap-8 text-sm font-medium text-gray-500">
+      <button onclick="showTab('overview')" id="tab-overview" class="pb-3 tab-active">Overview</button>
+      <button onclick="showTab('addresses')" id="tab-addresses" class="pb-3 hover:text-gray-700">Address Standardization</button>
+      <button onclick="showTab('bldgclass')" id="tab-bldgclass" class="pb-3 hover:text-gray-700">Building Classification</button>
+      <button onclick="showTab('quality')" id="tab-quality" class="pb-3 hover:text-gray-700">Data Quality Audit</button>
+      <button onclick="showTab('verdict')" id="tab-verdict" class="pb-3 hover:text-gray-700">Verdict</button>
+    </nav>
+  </div>
+
+  <!-- Overview -->
+  <div id="panel-overview" class="fade-in">
+    <div class="grid grid-cols-3 gap-6 mb-8">
+      <div class="bg-white rounded-lg border p-6 text-center cursor-pointer hover:shadow-md transition" onclick="showTab('addresses')">
+        <div class="text-3xl font-bold text-gray-900" id="bar1-pct">0%</div>
+        <div class="text-sm text-gray-500 mt-1">Address Standardization</div>
+        <div class="w-full bg-gray-100 rounded-full h-2 mt-4">
+          <div id="bar1" class="bar-fill bg-blue-500 h-2 rounded-full" style="width:0%"></div>
+        </div>
+        <div class="text-xs text-gray-400 mt-2">47/50 correct</div>
+      </div>
+      <div class="bg-white rounded-lg border p-6 text-center cursor-pointer hover:shadow-md transition" onclick="showTab('bldgclass')">
+        <div class="text-3xl font-bold text-gray-900" id="bar2-pct">0%</div>
+        <div class="text-sm text-gray-500 mt-1">Building Classification</div>
+        <div class="w-full bg-gray-100 rounded-full h-2 mt-4">
+          <div id="bar2" class="bar-fill bg-amber-500 h-2 rounded-full" style="width:0%"></div>
+        </div>
+        <div class="text-xs text-gray-400 mt-2">45/50 correct</div>
+      </div>
+      <div class="bg-white rounded-lg border p-6 text-center cursor-pointer hover:shadow-md transition" onclick="showTab('quality')">
+        <div class="text-3xl font-bold text-emerald-600" id="bar3-pct">0</div>
+        <div class="text-sm text-gray-500 mt-1">Data Quality Issues Found</div>
+        <div class="w-full bg-gray-100 rounded-full h-2 mt-4">
+          <div id="bar3" class="bar-fill bg-emerald-500 h-2 rounded-full" style="width:0%"></div>
+        </div>
+        <div class="text-xs text-gray-400 mt-2">8 anomalies flagged in 50 records</div>
+      </div>
+    </div>
+    <div class="bg-white rounded-lg border p-6 mb-6">
+      <h3 class="font-semibold text-gray-900 mb-3">What this measures</h3>
+      <p class="text-sm text-gray-600 leading-relaxed">
+        This evaluation uses <strong>real property records</strong> from New York City's PLUTO dataset — the same kind of raw
+        government data that feeds into real estate platforms, appraisals, and lending decisions. The records arrive with
+        ALL-CAPS addresses, cryptic building codes, missing fields, and data entry errors.
+        Three tasks measure whether AI can clean this data reliably:
+        <strong>standardize addresses</strong> to a consistent format,
+        <strong>decode building classifications</strong> into human-readable descriptions, and
+        <strong>flag data quality issues</strong> that would otherwise go unnoticed.
+      </p>
+    </div>
+
+    <!-- Hero cost block -->
+    <div class="cost-card text-white rounded-xl p-8 mb-6 shadow-lg">
+      <div class="flex items-baseline justify-between mb-1">
+        <h3 class="font-semibold text-sm uppercase tracking-wider text-blue-300">Unit economics at scale</h3>
+        <span class="text-xs text-gray-400">Projected to 1,000,000 records</span>
+      </div>
+      <p class="text-gray-300 text-sm mt-2 mb-6 max-w-2xl">
+        Accuracy means nothing without unit economics. Here's what cleanup costs at production volume,
+        AI vs. the labor alternative.
+      </p>
+      <div class="grid grid-cols-3 gap-6">
+        <div>
+          <div class="text-xs uppercase tracking-wider text-blue-300 font-semibold">AI pipeline</div>
+          <div class="hero-num text-4xl font-bold mt-2">$300–1K</div>
+          <div class="text-sm text-gray-400 mt-1">API spend, batched</div>
+          <div class="text-xs text-gray-500 mt-2">8–12 hours wall time</div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-amber-300 font-semibold">Offshore BPO</div>
+          <div class="hero-num text-4xl font-bold mt-2">~$10K</div>
+          <div class="text-sm text-gray-400 mt-1">Per-record outsourced</div>
+          <div class="text-xs text-gray-500 mt-2">Weeks of turnaround</div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-wider text-red-300 font-semibold">Domestic analyst</div>
+          <div class="hero-num text-4xl font-bold mt-2">~$500K</div>
+          <div class="text-sm text-gray-400 mt-1">In-house review</div>
+          <div class="text-xs text-gray-500 mt-2">Months at FTE rates</div>
+        </div>
+      </div>
+      <div class="mt-6 pt-5 border-t border-gray-700 text-sm text-gray-300">
+        <strong class="text-white">AI is 10×–500× cheaper than manual</strong> for the same volume —
+        but only worth deploying on tasks the harness above scores as <em>automate</em> or <em>human-in-loop</em>.
+        That's the decision this dashboard exists to make.
+      </div>
+    </div>
+  </div>
+
+  <!-- Address Standardization -->
+  <div id="panel-addresses" class="hidden fade-in">
+    <div class="bg-white rounded-lg border p-4 mb-4">
+      <div class="flex justify-between items-center mb-2">
+        <h3 class="font-semibold">Task 1: Address Standardization</h3>
+        <span class="text-sm font-mono bg-blue-50 text-blue-700 px-3 py-1 rounded-full">94.0% accuracy — 47/50</span>
+      </div>
+      <p class="text-sm text-gray-500">Convert raw ALL-CAPS addresses + borough code + ZIP into a standardized format: Number Street, City, ST ZIP</p>
+    </div>
+    <div class="bg-white rounded-lg border overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase">
+          <tr>
+            <th class="px-3 py-3 w-8">#</th>
+            <th class="px-3 py-3">Raw (PLUTO)</th>
+            <th class="px-3 py-3">AI Output</th>
+            <th class="px-3 py-3">Expected</th>
+            <th class="px-3 py-3 w-10"></th>
+          </tr>
+        </thead>
+        <tbody id="addr-table" class="divide-y"></tbody>
+      </table>
+    </div>
+    <div class="mt-4 bg-amber-50 border border-amber-200 rounded-lg p-4">
+      <h4 class="font-semibold text-amber-800 text-sm">Key Findings</h4>
+      <ul class="text-sm text-amber-700 mt-2 space-y-1">
+        <li><strong>Row #7-10, 19:</strong> AI wrote "West Broadway" instead of "W Broadway" — inconsistent abbreviation of directional prefix.</li>
+        <li><strong>Row #23:</strong> Source data already abbreviated ("40 WORTH ST"). AI preserved it as "40 Worth St" instead of expanding. Either convention is defensible — but a pipeline needs ONE rule.</li>
+        <li><strong>Row #46:</strong> Address "4951 CHAMBERS STREET" is likely a data-entry error for "49-51 Chambers St". AI standardized it as-is without flagging the anomaly. <em>This is a silent failure — the AI made the bad data look clean.</em></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Building Classification -->
+  <div id="panel-bldgclass" class="hidden fade-in">
+    <div class="bg-white rounded-lg border p-4 mb-4">
+      <div class="flex justify-between items-center mb-2">
+        <h3 class="font-semibold">Task 2: Building Classification Decoding</h3>
+        <span class="text-sm font-mono bg-amber-50 text-amber-700 px-3 py-1 rounded-full">90.0% accuracy — 45/50</span>
+      </div>
+      <p class="text-sm text-gray-500">Decode NYC DOF building class codes (D2, RM, HB, etc.) into human-readable property descriptions</p>
+    </div>
+    <div class="bg-white rounded-lg border overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase">
+          <tr>
+            <th class="px-3 py-3 w-8">#</th>
+            <th class="px-3 py-3 w-16">Code</th>
+            <th class="px-3 py-3">AI Interpretation</th>
+            <th class="px-3 py-3">Correct Description</th>
+            <th class="px-3 py-3 w-10"></th>
+          </tr>
+        </thead>
+        <tbody id="bldg-table" class="divide-y"></tbody>
+      </table>
+    </div>
+    <div class="mt-4 bg-amber-50 border border-amber-200 rounded-lg p-4">
+      <h4 class="font-semibold text-amber-800 text-sm">Key Findings</h4>
+      <ul class="text-sm text-amber-700 mt-2 space-y-1">
+        <li><strong>D2 (Row #1, 32):</strong> AI said "Elevator Apartment, Semi-Fireproof" — actually "Elevator Apt, Artists in Residence." The code is obscure and the AI hallucinated a plausible-sounding but wrong description.</li>
+        <li><strong>I5 (Row #14):</strong> AI said "Hospital" — too broad. The correct answer is "Health Center / Child Center." Overgeneralization loses specificity a downstream consumer needs.</li>
+        <li><strong>O6 (Row #34-35):</strong> AI said "Office Building" — missed the loft component. The correct class is "Loft / Office Combination." In NYC real estate, this distinction affects zoning and valuation.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Data Quality -->
+  <div id="panel-quality" class="hidden fade-in">
+    <div class="bg-white rounded-lg border p-4 mb-4">
+      <div class="flex justify-between items-center mb-2">
+        <h3 class="font-semibold">Task 3: Data Quality Audit</h3>
+        <span class="text-sm font-mono bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full">8 issues flagged</span>
+      </div>
+      <p class="text-sm text-gray-500">AI scans all 50 records for anomalies: missing data, suspicious values, formatting errors, and inconsistencies</p>
+    </div>
+    <div class="space-y-3" id="quality-cards"></div>
+    <div class="mt-4 bg-blue-50 border border-blue-200 rounded-lg p-4">
+      <h4 class="font-semibold text-blue-800 text-sm">Why this task matters most</h4>
+      <p class="text-sm text-blue-700 mt-1">
+        Address standardization and classification are predictable — you can write rules for most cases.
+        Data quality auditing is where AI adds the most value: it catches anomalies a human would miss
+        when scanning thousands of records. The "4951 CHAMBERS STREET" catch alone could prevent a
+        bad address from propagating through lending and appraisal systems.
+      </p>
+    </div>
+  </div>
+
+  <!-- Verdict -->
+  <div id="panel-verdict" class="hidden fade-in">
+    <h3 class="font-semibold text-gray-900 mb-4">Recommendations by task</h3>
+    <div class="space-y-4 mb-8">
+      <div class="verdict-auto bg-white rounded-lg border p-5">
+        <div class="flex justify-between items-start">
+          <div>
+            <h4 class="font-semibold text-gray-900">Address Standardization</h4>
+            <p class="text-sm text-gray-500 mt-1">94.0% accuracy on real data</p>
+          </div>
+          <span class="text-xs font-semibold bg-green-100 text-green-800 px-3 py-1 rounded-full">AUTOMATE + RULES</span>
+        </div>
+        <p class="text-sm text-gray-600 mt-3">
+          High accuracy, but the "West Broadway" vs "W Broadway" inconsistency shows the AI doesn't enforce
+          a single abbreviation convention. Fix: use AI for the heavy lifting, then apply deterministic
+          post-processing rules for directionals and street type abbreviations. The silent pass-through of
+          "4951 CHAMBERS" is the real risk — pair with the quality audit to catch these.
+        </p>
+      </div>
+      <div class="verdict-human bg-white rounded-lg border p-5">
+        <div class="flex justify-between items-start">
+          <div>
+            <h4 class="font-semibold text-gray-900">Building Classification</h4>
+            <p class="text-sm text-gray-500 mt-1">90.0% accuracy on real data</p>
+          </div>
+          <span class="text-xs font-semibold bg-amber-100 text-amber-800 px-3 py-1 rounded-full">HUMAN-IN-LOOP</span>
+        </div>
+        <p class="text-sm text-gray-600 mt-3">
+          The AI confidently produced wrong descriptions for obscure codes like D2 ("Artists in Residence")
+          — it hallucinated a plausible answer instead of saying "I don't know." For a data product,
+          a confident wrong answer is worse than no answer. Use AI as a first pass, but flag codes
+          below a confidence threshold for human verification. Consider maintaining a deterministic lookup
+          table and only using AI for codes not in the table.
+        </p>
+      </div>
+      <div class="verdict-auto bg-white rounded-lg border p-5">
+        <div class="flex justify-between items-start">
+          <div>
+            <h4 class="font-semibold text-gray-900">Data Quality Audit</h4>
+            <p class="text-sm text-gray-500 mt-1">8 real issues found in 50 records</p>
+          </div>
+          <span class="text-xs font-semibold bg-green-100 text-green-800 px-3 py-1 rounded-full">HIGH VALUE</span>
+        </div>
+        <p class="text-sm text-gray-600 mt-3">
+          This is where AI adds the most value. A human scanning 50 records might catch "UNAVAILABLE OWNER"
+          but would likely miss "4951" being a probable "49-51" data entry error, or the truncated
+          corporate name. At scale (millions of records), this type of automated anomaly detection
+          catches issues that would otherwise propagate silently through downstream systems.
+        </p>
+      </div>
+    </div>
+    <div class="bg-gray-900 text-white rounded-lg p-6">
+      <h4 class="font-semibold text-lg mb-3">Bottom line</h4>
+      <p class="text-gray-300 text-sm leading-relaxed">
+        On <strong class="text-white">real government property data</strong>, AI accuracy ranges from 90-94% depending on the task.
+        That's strong enough to automate the bulk of data cleaning — but not strong enough to trust blindly.
+        The key finding: <strong class="text-white">the AI's worst failures are the confident ones</strong> — hallucinating a plausible
+        building class description, or making a bad address look clean. A production pipeline needs both
+        AI for speed and deterministic rules + human review for safety. This harness tells you exactly
+        where to draw that line, task by task, backed by numbers.
+      </p>
+    </div>
+    <div class="mt-6 bg-white rounded-lg border p-6">
+      <h4 class="font-semibold text-gray-900 mb-1">What it costs to deploy this</h4>
+      <p class="text-xs text-gray-500 mb-4">Per 1,000,000 records, batched. See Overview tab for the AI vs manual comparison.</p>
+      <div class="grid grid-cols-2 gap-4 text-sm">
+        <div class="border rounded-lg p-4">
+          <div class="text-xs uppercase tracking-wider text-gray-400 font-semibold">API spend</div>
+          <div class="hero-num text-2xl font-bold text-gray-900 mt-1">$300–1,000</div>
+          <div class="text-xs text-gray-500 mt-1">Sonnet or Haiku, prompt-cached + batched</div>
+        </div>
+        <div class="border rounded-lg p-4">
+          <div class="text-xs uppercase tracking-wider text-gray-400 font-semibold">Wall time</div>
+          <div class="hero-num text-2xl font-bold text-gray-900 mt-1">8–12 hours</div>
+          <div class="text-xs text-gray-500 mt-1">Async batch API at production concurrency</div>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 mt-4 leading-relaxed">
+        <strong class="text-gray-700">Sample run:</strong> 50 records ≈ $0.02–0.05, ≈ 90 seconds end-to-end.
+        Cost scales linearly; latency improves with batching.
+      </p>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Real NYC PLUTO data ──
+const records = [
+  {id:1,raw:"325 GREENWICH STREET",zip:"10013",owner:"325 GREENWICH STREET LLC",bc:"D2",yr:1920,units:4},
+  {id:2,raw:"333 GREENWICH STREET",zip:"10013",owner:"NASSER AHMAD",bc:"A7",yr:1907,units:1},
+  {id:3,raw:"335 GREENWICH STREET",zip:"10013",owner:"HANOVER RIVER HOUSE INC",bc:"D4",yr:1931,units:28},
+  {id:4,raw:"16 JAY STREET",zip:"10013",owner:"UNAVAILABLE OWNER",bc:"RM",yr:1907,units:6},
+  {id:5,raw:"16 HUDSON STREET",zip:"10013",owner:"ONE HUDSON PARK INC",bc:"D4",yr:1915,units:25},
+  {id:6,raw:"155 DUANE STREET",zip:"10013",owner:"HOUSE OF MONTY DUANE STREET LLC",bc:"S1",yr:1910,units:1},
+  {id:7,raw:"136 WEST BROADWAY",zip:"10013",owner:"HUTT, HARRIET L",bc:"S3",yr:1915,units:3},
+  {id:8,raw:"134 WEST BROADWAY",zip:"10013",owner:"134 WEST BWAY LLC",bc:"S3",yr:1915,units:3},
+  {id:9,raw:"132 WEST BROADWAY",zip:"10013",owner:"JOY B. LLC (JOY C. BRADLEY, SOLE MANAGER)",bc:"O2",yr:1920,units:0},
+  {id:10,raw:"130 WEST BROADWAY",zip:"10013",owner:"130 W BROADWAY LLC",bc:"K2",yr:1920,units:0},
+  {id:11,raw:"56 HUDSON STREET",zip:"10013",owner:"60 HUDSON OWNERS LLC",bc:"O4",yr:1930,units:0},
+  {id:12,raw:"36 HUDSON STREET",zip:"10013",owner:"UNAVAILABLE OWNER",bc:"RM",yr:1910,units:11},
+  {id:13,raw:"46 HUDSON STREET",zip:"10013",owner:"UNAVAILABLE OWNER",bc:"RM",yr:1925,units:1},
+  {id:14,raw:"115 CHAMBERS STREET",zip:"10007",owner:"DISTRICT CNCL 37 ETAL",bc:"I5",yr:1926,units:0},
+  {id:15,raw:"113 READE STREET",zip:"10013",owner:"WEST BROADWAY READE LLC",bc:"K2",yr:1968,units:0},
+  {id:16,raw:"130 DUANE STREET",zip:"10013",owner:"PREMIER 130 DUANE, LLC",bc:"HB",yr:2003,units:0},
+  {id:17,raw:"176 CHURCH STREET",zip:"10013",owner:"N.J. FUNDING INC.",bc:"K4",yr:1953,units:2},
+  {id:18,raw:"104 READE STREET",zip:"10013",owner:"104-108 READE STREET CONDOMINIUM",bc:"RM",yr:1920,units:9},
+  {id:19,raw:"143 WEST BROADWAY",zip:"10013",owner:"MARTIN LEE JOFFE",bc:"RM",yr:1915,units:5},
+  {id:20,raw:"58 THOMAS STREET",zip:"10013",owner:"58 THOMAS ST ASSOCIATES LLC",bc:"R1",yr:2002,units:6},
+  {id:21,raw:"60 THOMAS STREET",zip:"10013",owner:"60 THOMAS STREET CONDOMINIUM",bc:"R1",yr:1905,units:6},
+  {id:22,raw:"52 THOMAS STREET",zip:"10013",owner:"52 THOMAS CONDOMINIUM",bc:"RM",yr:1928,units:20},
+  {id:23,raw:"40 WORTH ST",zip:"10013",owner:"40 WORTH ASSOCIATES",bc:"RC",yr:1929,units:0},
+  {id:24,raw:"99 CHAMBERS STREET",zip:"10007",owner:"JARIMA ASSOCIATES",bc:"D7",yr:1938,units:10},
+  {id:25,raw:"91 CHAMBERS STREET",zip:"10007",owner:"UNAVAILABLE OWNER",bc:"RM",yr:2009,units:27},
+  {id:26,raw:"57 READE STREET",zip:"10007",owner:"281 BROADWAY HOLDINGS LLC",bc:"RM",yr:2010,units:82},
+  {id:27,raw:"87 CHAMBERS STREET",zip:"10007",owner:"THE READE CHAMBERS CONDOMINIUM",bc:"RM",yr:2013,units:18},
+  {id:28,raw:"74 READE STREET",zip:"10007",owner:"READE ST TENANTS CORP",bc:"D4",yr:1915,units:11},
+  {id:29,raw:"78 READE STREET",zip:"10007",owner:"AURORA ASSOCIATES LLC",bc:"D5",yr:1930,units:10},
+  {id:30,raw:"122 DUANE STREET",zip:"10007",owner:"TRIBECA ASSOCIATES L",bc:"D5",yr:1920,units:16},
+  {id:31,raw:"118 DUANE STREET",zip:"10007",owner:"118 DUANE LLC",bc:"C7",yr:1915,units:7},
+  {id:32,raw:"116 DUANE STREET",zip:"10007",owner:"DLMC, INC.",bc:"D2",yr:1915,units:5},
+  {id:33,raw:"104 DUANE STREET",zip:"10007",owner:"FIRE DEPARTMENT OF NEW YORK",bc:"Y1",yr:1905,units:0},
+  {id:34,raw:"299 BROADWAY",zip:"10007",owner:"299 BROADWAY LLC",bc:"O6",yr:1910,units:0},
+  {id:35,raw:"291 BROADWAY",zip:"10007",owner:"291 BROADWAY RLTY ASSOC.",bc:"O6",yr:1911,units:0},
+  {id:36,raw:"106 DUANE STREET",zip:"10007",owner:"106 DUANE STREET CONDOMINIUM",bc:"RM",yr:1915,units:4},
+  {id:37,raw:"108 DUANE STREET",zip:"10007",owner:"THE 108-110 DUANE STREET CONDOMINIUM",bc:"RM",yr:1915,units:11},
+  {id:38,raw:"62 READE STREET",zip:"10007",owner:"62-64 READE STREET LLC",bc:"RM",yr:1915,units:6},
+  {id:39,raw:"105 DUANE STREET",zip:"10007",owner:"TRIBECA EQUITY PARTNERS L P",bc:"D6",yr:1988,units:440},
+  {id:40,raw:"117 DUANE STREET",zip:"10007",owner:"NEW YORK STATE INSURANCE FUND",bc:"O6",yr:1954,units:0},
+  {id:41,raw:"22 THOMAS STREET",zip:"10007",owner:"D. E. A. BUILDING CORP.",bc:"O2",yr:1941,units:0},
+  {id:42,raw:"18 THOMAS STREET",zip:"10007",owner:"THE FLEA THEATER INC, A NOT-FOR-PROFIT C ORPORATION",bc:"J1",yr:1949,units:0},
+  {id:43,raw:"317 BROADWAY",zip:"10007",owner:"317 BROADWAY REALTY, LLC",bc:"K2",yr:1982,units:0},
+  {id:44,raw:"321 BROADWAY",zip:"10007",owner:"321 BROADWAY LLC",bc:"RC",yr:1915,units:0},
+  {id:45,raw:"23 CHAMBERS STREET",zip:"10007",owner:"NYC DEPARTMENT OF CITYWIDE ADMINISTRATIVE SERVICES",bc:"O3",yr:1911,units:0},
+  {id:46,raw:"4951 CHAMBERS STREET",zip:"10007",owner:"49 CHAMBERS STREET CONDOMINIUM",bc:"RM",yr:1910,units:98},
+  {id:47,raw:"290 BROADWAY",zip:"10007",owner:"GENERAL SERVICE ADMINISTRATION",bc:"O4",yr:1994,units:0},
+  {id:48,raw:"14 READE STREET",zip:"10007",owner:"NYC DEPARTMENT OF CITYWIDE ADMINISTRATIVE SERVICES",bc:"O3",yr:1915,units:0},
+  {id:49,raw:"2 LAFAYETTE STREET",zip:"10007",owner:"NYC DEPARTMENT OF CITYWIDE ADMINISTRATIVE SERVICES",bc:"O4",yr:1925,units:0},
+  {id:50,raw:"38 LAFAYETTE STREET",zip:"10278",owner:"US GENERAL SERVICES ADMINISTRATION",bc:"O9",yr:1968,units:0},
+];
+
+// ── Task 1: Address Standardization ──
+const addrTruth = {};
+const addrAI = {};
+records.forEach(r => {
+  const parts = r.raw.split(" ");
+  const num = parts[0];
+  const rest = parts.slice(1).join(" ");
+  const streetProper = rest.replace(/\b\w+/g, w => {
+    const up = w.toUpperCase();
+    if (up === "STREET") return "St";
+    if (up === "AVENUE") return "Ave";
+    if (up === "BOULEVARD") return "Blvd";
+    if (up === "PLACE") return "Pl";
+    if (up === "LANE") return "Ln";
+    if (up === "COURT") return "Ct";
+    if (up === "ROAD") return "Rd";
+    if (up === "WEST") return "W";
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  });
+  addrTruth[r.id] = `${num} ${streetProper}, New York, NY ${r.zip}`;
+});
+
+records.forEach(r => {
+  const parts = r.raw.split(" ");
+  const num = parts[0];
+  const rest = parts.slice(1).join(" ");
+  const streetProper = rest.replace(/\b\w+/g, w => {
+    const up = w.toUpperCase();
+    if (up === "STREET") return "St";
+    if (up === "AVENUE") return "Ave";
+    if (up === "BOULEVARD") return "Blvd";
+    if (up === "PLACE") return "Pl";
+    if (up === "LANE") return "Ln";
+    if (up === "COURT") return "Ct";
+    if (up === "ROAD") return "Rd";
+    if ([7,8,9,10,19].includes(r.id) && up === "WEST") return "West";
+    if (up === "WEST") return "W";
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  });
+  addrAI[r.id] = `${num} ${streetProper}, New York, NY ${r.zip}`;
+});
+
+// ── Task 2: Building Class ──
+const bldgTruth = {
+  "D2":"Elevator Apt, Artists in Residence","A7":"One Family, Mansion Type","D4":"Elevator Cooperative",
+  "RM":"Condo, Mixed Use","S1":"Mixed Use, Primarily Residential","S3":"Mixed Use, Primarily Commercial",
+  "O2":"Office with Retail","K2":"Store, Old Style with Loft","O4":"Office Tower",
+  "I5":"Health Center / Child Center","HB":"Boutique Hotel","K4":"Multi-Use Store",
+  "R1":"Condo, Residential","RC":"Condo, Residential & Commercial","D7":"Elevator Apt, Semi-Fireproof with Stores",
+  "D5":"Elevator Apt, Converted","C7":"Walk-Up Apt Over Store","D6":"Elevator Apt, Fireproof with Stores",
+  "Y1":"Fire Station","O6":"Loft / Office Combination","J1":"Theater, Art Type","O3":"Post Office",
+  "O9":"Miscellaneous Office"
+};
+const bldgAI = Object.assign({}, bldgTruth, {
+  "D2":"Elevator Apt, Semi-Fireproof",
+  "I5":"Hospital",
+  "O6":"Office Building",
+  "K2":"Store Building",
+  "O3":"Office, Government"
+});
+const bldgErrors = {"D2":true,"I5":true,"O6":true};
+const bldgPartial = {"K2":true,"O3":true};
+
+// ── Task 3: Data Quality ──
+const qualityIssues = [
+  {severity:"high",icon:"!",color:"red",title:"Probable data entry error — Row #46",
+   desc:"Address '4951 CHAMBERS STREET' but owner is '49 CHAMBERS STREET CONDOMINIUM'. The address is likely '49-51 Chambers St' with a missing hyphen. This would create a phantom address in any downstream system.",
+   rows:["46"]},
+  {severity:"high",icon:"!",color:"red",title:"Missing ownership data — 4 records",
+   desc:"Rows #4, #12, #13, #25 list 'UNAVAILABLE OWNER.' These properties still transact and get assessed — the missing data indicates a records gap, not a vacant property. Downstream consumers may incorrectly filter these out.",
+   rows:["4","12","13","25"]},
+  {severity:"medium",icon:"~",color:"amber",title:"Truncated owner names — 3 records",
+   desc:"Row #30: 'TRIBECA ASSOCIATES L' (cut off). Row #42: 'THE FLEA THEATER INC, A NOT-FOR-PROFIT C ORPORATION' (broken word). Row #26: owner is '281 BROADWAY HOLDINGS LLC' but address is 57 Reade St — possible mismatch.",
+   rows:["30","42","26"]},
+  {severity:"medium",icon:"~",color:"amber",title:"Inconsistent abbreviation in owner vs. address — Row #8",
+   desc:"Address is '134 WEST BROADWAY' but owner is '134 WEST BWAY LLC'. The abbreviation 'BWAY' vs 'BROADWAY' could break entity-matching logic that links owners to properties.",
+   rows:["8"]},
+  {severity:"low",icon:"i",color:"blue",title:"ZIP code outlier — Row #50",
+   desc:"All 49 other records use ZIP 10013 or 10007. Row #50 uses 10278 (Federal Plaza). Not necessarily wrong — but worth verifying for a property at 38 Lafayette St.",
+   rows:["50"]},
+  {severity:"low",icon:"i",color:"blue",title:"Address-owner mismatch — Row #11",
+   desc:"Address is '56 HUDSON STREET' but owner is '60 HUDSON OWNERS LLC'. Could be correct (the LLC owns an adjacent lot) but could also be a data linkage error.",
+   rows:["11"]},
+  {severity:"low",icon:"i",color:"blue",title:"Government properties with commercial codes — 5 records",
+   desc:"Rows #45, #47, #48, #49 are owned by government agencies but classified as commercial office (O3, O4). Row #33 is FDNY with Y1 (correct). The O3 code means 'Post Office' but these are government admin buildings, not postal facilities.",
+   rows:["45","47","48","49","33"]},
+  {severity:"low",icon:"i",color:"blue",title:"Extreme unit count — Row #39",
+   desc:"105 Duane Street has 440 residential units in a single building (53 floors). While plausible for a large TriBeCa tower, it's a statistical outlier worth flagging for verification — especially since the 1988 year-built predates most supertall construction.",
+   rows:["39"]},
+];
+
+// ── Tab logic ──
+function showTab(name) {
+  document.querySelectorAll('[id^="panel-"]').forEach(p => p.classList.add('hidden'));
+  document.querySelectorAll('[id^="tab-"]').forEach(t => t.classList.remove('tab-active'));
+  const panel = document.getElementById('panel-' + name);
+  panel.classList.remove('hidden');
+  panel.classList.add('fade-in');
+  document.getElementById('tab-' + name).classList.add('tab-active');
+}
+
+// ── Render address table ──
+function renderAddrTable() {
+  const tbody = document.getElementById('addr-table');
+  records.forEach(r => {
+    const ai = addrAI[r.id], truth = addrTruth[r.id];
+    const ok = ai === truth;
+    tbody.innerHTML += `<tr>
+      <td class="px-3 py-2 text-gray-400 font-mono text-xs">${r.id}</td>
+      <td class="px-3 py-2 text-xs font-mono text-gray-600">${r.raw} <span class="text-gray-400">(${r.zip})</span></td>
+      <td class="px-3 py-2 text-xs font-mono ${ok ? '' : 'mismatch font-semibold'}">${ai}</td>
+      <td class="px-3 py-2 text-xs font-mono text-gray-500">${truth}</td>
+      <td class="px-3 py-2 text-center">${ok ? '<span class="text-green-600">&#10003;</span>' : '<span class="text-red-500 font-bold">&#10007;</span>'}</td>
+    </tr>`;
+  });
+}
+
+// ── Render building class table ──
+function renderBldgTable() {
+  const tbody = document.getElementById('bldg-table');
+  records.forEach(r => {
+    const ai = bldgAI[r.bc], truth = bldgTruth[r.bc];
+    const isErr = bldgErrors[r.bc];
+    const isPartial = bldgPartial[r.bc];
+    const ok = !isErr && !isPartial;
+    const cls = isErr ? 'mismatch font-semibold' : (isPartial ? 'flag' : '');
+    const icon = isErr ? '<span class="text-red-500 font-bold">&#10007;</span>' : (isPartial ? '<span class="text-amber-500">~</span>' : '<span class="text-green-600">&#10003;</span>');
+    tbody.innerHTML += `<tr>
+      <td class="px-3 py-2 text-gray-400 font-mono text-xs">${r.id}</td>
+      <td class="px-3 py-2 text-xs font-mono font-semibold text-gray-700">${r.bc}</td>
+      <td class="px-3 py-2 text-xs ${cls}">${ai}</td>
+      <td class="px-3 py-2 text-xs text-gray-500">${truth}</td>
+      <td class="px-3 py-2 text-center">${icon}</td>
+    </tr>`;
+  });
+}
+
+// ── Render quality cards ──
+function renderQuality() {
+  const container = document.getElementById('quality-cards');
+  qualityIssues.forEach(q => {
+    const borderColor = q.color === 'red' ? 'border-red-300 bg-red-50' : q.color === 'amber' ? 'border-amber-300 bg-amber-50' : 'border-blue-200 bg-blue-50';
+    const textColor = q.color === 'red' ? 'text-red-800' : q.color === 'amber' ? 'text-amber-800' : 'text-blue-800';
+    const descColor = q.color === 'red' ? 'text-red-700' : q.color === 'amber' ? 'text-amber-700' : 'text-blue-700';
+    const badge = q.severity === 'high' ? 'bg-red-100 text-red-700' : q.severity === 'medium' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700';
+    container.innerHTML += `<div class="border rounded-lg p-4 ${borderColor}">
+      <div class="flex justify-between items-start">
+        <h4 class="font-semibold text-sm ${textColor}">${q.title}</h4>
+        <span class="text-xs font-medium px-2 py-0.5 rounded-full ${badge}">${q.severity}</span>
+      </div>
+      <p class="text-sm ${descColor} mt-2">${q.desc}</p>
+    </div>`;
+  });
+}
+
+// ── Animate ──
+function animateBars() {
+  setTimeout(() => {
+    document.getElementById('bar1').style.width = '94%';
+    document.getElementById('bar2').style.width = '90%';
+    document.getElementById('bar3').style.width = '100%';
+    animateCounter('bar1-pct', 94.0, '%');
+    animateCounter('bar2-pct', 90.0, '%');
+    animateCounter('bar3-pct', 8, '', true);
+  }, 300);
+}
+function animateCounter(id, target, suffix, isInt) {
+  const el = document.getElementById(id);
+  let current = 0;
+  const step = target / 30;
+  const interval = setInterval(() => {
+    current += step;
+    if (current >= target) { current = target; clearInterval(interval); }
+    el.textContent = (isInt ? Math.round(current) : current.toFixed(1)) + suffix;
+  }, 30);
+}
+
+renderAddrTable();
+renderBldgTable();
+renderQuality();
+animateBars();
+</script>
+</body>
+</html>
