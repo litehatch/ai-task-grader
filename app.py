@@ -26,25 +26,18 @@ st.markdown("""
 st.title("AI Data Cleanup Evaluation")
 st.caption("Measure AI accuracy on real property records — task by task, backed by numbers.")
 
-KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".api_key")
-
-def load_saved_key():
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE) as f:
-            return f.read().strip()
+def load_env_key():
     return os.environ.get("ANTHROPIC_API_KEY", "")
-
-def save_key(key):
-    with open(KEY_FILE, "w") as f:
-        f.write(key)
 
 # ── Sidebar ──
 with st.sidebar:
     st.header("Configuration")
-    saved_key = load_saved_key()
-    api_key = st.text_input("Anthropic API Key", type="password", value=saved_key)
-    if api_key and api_key != saved_key:
-        save_key(api_key)
+    api_key = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        value=load_env_key(),
+        help="Your key is used only for this session. Nothing is saved server-side.",
+    )
     model = st.selectbox("Model", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
     st.divider()
 
