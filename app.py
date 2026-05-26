@@ -53,7 +53,7 @@ with st.sidebar:
     st.header("Configuration")
     if _env_key:
         api_key = _env_key
-        st.caption("✓ Demo mode — no API key required to try the live evaluation.")
+        st.caption("✓ Ready — no API key required to run an evaluation.")
     else:
         api_key = st.text_input(
             "Anthropic API Key",
