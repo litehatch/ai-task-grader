@@ -6,6 +6,8 @@ import time
 import os
 import csv
 import io
+import html
+from datetime import datetime
 
 try:
     import anthropic
@@ -39,6 +41,22 @@ with st.sidebar:
         help="Your key is used only for this session. Nothing is saved server-side.",
     )
     model = st.selectbox("Model", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
+    st.divider()
+
+    with st.expander("📂 Load saved run", expanded=False):
+        st.caption("Drop in a previously downloaded `aitaskgrader-*.json` to view its results without re-running.")
+        uploaded_run = st.file_uploader("Run JSON", type=["json"], key="saved_run", label_visibility="collapsed")
+        if uploaded_run is not None:
+            try:
+                payload = json.loads(uploaded_run.read().decode("utf-8"))
+                if not isinstance(payload, dict) or "data" not in payload or "results" not in payload:
+                    raise ValueError("File missing required 'data' and 'results' fields.")
+                st.session_state["data"] = payload["data"]
+                st.session_state["results"] = payload["results"]
+                st.session_state["data_source"] = payload.get("city", "uploaded")
+                st.success(f"Loaded {len(payload['data'])} records from {payload.get('city', 'saved run')} (generated {payload.get('generated_at', 'unknown date')[:10]}).")
+            except Exception as e:
+                st.error(f"Couldn't load that file: {e}")
     st.divider()
 
     st.header("Data Source")
@@ -480,6 +498,228 @@ Return JSON array of issues found:
     raw = call_claude(client, prompt, model_name)
     return parse_json_response(raw)
 
+# ── Share/export helpers ──
+def export_json(data, results, city, model_name):
+    payload = {
+        "version": "1",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "city": city,
+        "model": model_name,
+        "data": data,
+        "results": results,
+    }
+    return json.dumps(payload, indent=2, default=str)
+
+def _esc(v):
+    return html.escape(str(v)) if v is not None else ""
+
+def generate_html_report(data, results, city, model_name):
+    city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
+    timestamp = datetime.now().strftime("%B %-d, %Y at %-I:%M %p")
+    record_count = len(data)
+
+    # Verdict block
+    verdict_html = ""
+    verdict = results.get("verdict")
+    if verdict and isinstance(verdict, dict):
+        tasks_rows = ""
+        for t in verdict.get("tasks", []):
+            tasks_rows += f"""
+            <tr>
+              <td class="px-4 py-3 font-semibold text-sm text-gray-900 align-top">{_esc(t.get('name', ''))}</td>
+              <td class="px-4 py-3 text-sm text-gray-700 align-top">{_esc(t.get('recommendation', ''))}</td>
+              <td class="px-4 py-3 text-sm text-gray-600 align-top leading-relaxed">{_esc(t.get('rationale', ''))}</td>
+            </tr>"""
+        bottom_line = _esc(verdict.get("bottom_line", ""))
+        verdict_html = f"""
+        <div class="bg-white rounded-lg border overflow-hidden mb-4">
+          <table class="w-full">
+            <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase tracking-wider">
+              <tr><th class="px-4 py-3">Task</th><th class="px-4 py-3">Recommendation</th><th class="px-4 py-3">Rationale</th></tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100">{tasks_rows}</tbody>
+          </table>
+        </div>
+        <div class="bg-blue-50 border border-blue-200 rounded-lg p-5 mb-6">
+          <p class="text-sm text-blue-900 leading-relaxed"><strong>Bottom line:</strong> {bottom_line}</p>
+        </div>"""
+
+    # Quality issues
+    quality_html = ""
+    if results.get("quality"):
+        for issue in results["quality"]:
+            severity = issue.get("severity", "low")
+            color = {"high": "border-red-300 bg-red-50", "medium": "border-amber-300 bg-amber-50"}.get(severity, "border-blue-200 bg-blue-50")
+            badge = {"high": "bg-red-100 text-red-700", "medium": "bg-amber-100 text-amber-700"}.get(severity, "bg-blue-100 text-blue-700")
+            quality_html += f"""
+            <div class="border rounded-lg p-4 mb-3 {color}">
+              <div class="flex justify-between items-start gap-3">
+                <h4 class="font-semibold text-sm text-gray-900">{_esc(issue.get('title', 'Issue'))}</h4>
+                <span class="text-xs font-medium px-2 py-0.5 rounded-full {badge} whitespace-nowrap">{_esc(severity)}</span>
+              </div>
+              <p class="text-sm text-gray-700 mt-2 leading-relaxed">{_esc(issue.get('description', ''))}</p>
+            </div>"""
+
+    # Classifications
+    classifications_html = ""
+    class_data = results.get("classifications", {})
+    if class_data:
+        nested = any(isinstance(v, dict) for v in class_data.values())
+        if nested:
+            for category, mappings in class_data.items():
+                if not isinstance(mappings, dict):
+                    continue
+                rows = "".join(
+                    f"""<tr><td class="px-4 py-2 font-semibold text-gray-700 text-sm align-top w-1/4">{_esc(k)}</td><td class="px-4 py-2 text-sm text-gray-600 align-top leading-relaxed">{_esc(v)}</td></tr>"""
+                    for k, v in mappings.items()
+                )
+                classifications_html += f"""
+                <div class="mb-5">
+                  <h4 class="font-semibold text-gray-700 mb-2 text-xs uppercase tracking-wider">{_esc(category.replace('_', ' ').title())}</h4>
+                  <div class="bg-white rounded-lg border overflow-hidden">
+                    <table class="w-full"><tbody class="divide-y divide-gray-100">{rows}</tbody></table>
+                  </div>
+                </div>"""
+        else:
+            rows = "".join(
+                f"""<tr><td class="px-4 py-2 font-semibold text-gray-700 text-sm align-top w-1/6">{_esc(k)}</td><td class="px-4 py-2 text-sm text-gray-600 align-top leading-relaxed">{_esc(v)}</td></tr>"""
+                for k, v in class_data.items()
+            )
+            classifications_html = f"""
+            <div class="bg-white rounded-lg border overflow-hidden">
+              <table class="w-full"><tbody class="divide-y divide-gray-100">{rows}</tbody></table>
+            </div>"""
+
+    # Addresses
+    addr_rows_html = ""
+    addr_data = results.get("addresses", {})
+    if addr_data:
+        for i, r in enumerate(data):
+            entry = addr_data.get(i + 1, {})
+            if isinstance(entry, str):
+                entry = {"standardized": entry, "changes": []}
+            raw = r.get("address", "")
+            standardized = entry.get("standardized", "—")
+            changes = "; ".join(entry.get("changes", [])) or "—"
+            addr_rows_html += f"""
+            <tr>
+              <td class="px-3 py-2 text-xs text-gray-400 font-mono">{i+1}</td>
+              <td class="px-3 py-2 text-xs font-mono text-gray-700">{_esc(raw)}</td>
+              <td class="px-3 py-2 text-xs font-mono text-gray-900">{_esc(standardized)}</td>
+              <td class="px-3 py-2 text-xs text-gray-500">{_esc(changes)}</td>
+            </tr>"""
+
+    addresses_html = f"""
+    <div class="bg-white rounded-lg border overflow-x-auto">
+      <table class="w-full">
+        <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase tracking-wider">
+          <tr>
+            <th class="px-3 py-3 w-8">#</th>
+            <th class="px-3 py-3">Raw</th>
+            <th class="px-3 py-3">Standardized</th>
+            <th class="px-3 py-3">Changes</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-100">{addr_rows_html}</tbody>
+      </table>
+    </div>""" if addr_rows_html else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Task Grader — {_esc(city_label)} Report</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+  body {{ font-family: 'Inter', sans-serif; }}
+  .hero-num {{ font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }}
+  .cost-card {{ background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); }}
+</style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+<div class="max-w-5xl mx-auto px-6 py-10">
+
+  <!-- Header -->
+  <div class="mb-8">
+    <div class="flex items-center gap-3 mb-2">
+      <h1 class="text-3xl font-bold text-gray-900 tracking-tight">AI Task Grader Report</h1>
+      <span class="text-xs font-semibold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">{_esc(city_label.upper())}</span>
+    </div>
+    <p class="text-gray-600 text-base">Evaluation of {record_count} real {_esc(city_label)} property records — task by task, backed by numbers.</p>
+    <div class="flex flex-wrap gap-x-6 gap-y-2 mt-4 text-sm text-gray-500">
+      <span><strong class="text-gray-700">Generated:</strong> {_esc(timestamp)}</span>
+      <span><strong class="text-gray-700">Model:</strong> {_esc(model_name)}</span>
+      <span><strong class="text-gray-700">Records:</strong> {record_count}</span>
+    </div>
+  </div>
+
+  <!-- Verdict -->
+  <section class="mb-8">
+    <h2 class="text-xl font-bold text-gray-900 mb-3">Verdict</h2>
+    {verdict_html or '<p class="text-gray-500 text-sm">No verdict generated.</p>'}
+  </section>
+
+  <!-- Cost block -->
+  <section class="cost-card text-white rounded-xl p-8 mb-10 shadow-lg">
+    <div class="flex items-baseline justify-between mb-1">
+      <div class="text-xs font-bold uppercase tracking-wider text-blue-300">Unit economics at scale</div>
+      <div class="text-xs text-gray-400">Projected to 1,000,000 records</div>
+    </div>
+    <p class="text-gray-300 text-sm mt-2 mb-6 max-w-2xl">
+      Accuracy means nothing without unit economics. Here's what cleanup costs at production volume — AI vs. the labor alternative.
+    </p>
+    <div class="grid grid-cols-3 gap-6">
+      <div>
+        <div class="text-xs uppercase tracking-wider text-blue-300 font-semibold">AI pipeline</div>
+        <div class="hero-num text-4xl font-bold mt-2">$300–1K</div>
+        <div class="text-sm text-gray-400 mt-1">API spend, batched</div>
+        <div class="text-xs text-gray-500 mt-2">8–12 hours wall time</div>
+      </div>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-amber-300 font-semibold">Offshore BPO</div>
+        <div class="hero-num text-4xl font-bold mt-2">~$10K</div>
+        <div class="text-sm text-gray-400 mt-1">Per-record outsourced</div>
+        <div class="text-xs text-gray-500 mt-2">Weeks of turnaround</div>
+      </div>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-red-300 font-semibold">Domestic analyst</div>
+        <div class="hero-num text-4xl font-bold mt-2">~$500K</div>
+        <div class="text-sm text-gray-400 mt-1">In-house review</div>
+        <div class="text-xs text-gray-500 mt-2">Months at FTE rates</div>
+      </div>
+    </div>
+    <div class="mt-6 pt-5 border-t border-gray-700 text-sm text-gray-300">
+      <strong class="text-white">AI is 10×–500× cheaper than manual</strong> on the tasks the verdict above scores safe to automate.
+    </div>
+  </section>
+
+  <!-- Data Quality -->
+  <section class="mb-10">
+    <h2 class="text-xl font-bold text-gray-900 mb-3">Data Quality Issues</h2>
+    {quality_html or '<p class="text-gray-500 text-sm">No quality issues to display.</p>'}
+  </section>
+
+  <!-- Classifications -->
+  <section class="mb-10">
+    <h2 class="text-xl font-bold text-gray-900 mb-3">Classification Decoding</h2>
+    {classifications_html or '<p class="text-gray-500 text-sm">No classifications to display.</p>'}
+  </section>
+
+  <!-- Addresses -->
+  <section class="mb-10">
+    <h2 class="text-xl font-bold text-gray-900 mb-3">Address Standardization</h2>
+    {addresses_html or '<p class="text-gray-500 text-sm">No address results to display.</p>'}
+  </section>
+
+  <footer class="text-center text-xs text-gray-400 mt-12 pt-6 border-t">
+    Generated by <strong class="text-gray-600">AI Task Grader</strong> · {_esc(timestamp)}
+  </footer>
+</div>
+</body>
+</html>"""
+
 # ── Main ──
 if not api_key:
     st.info("Enter your Anthropic API key in the sidebar to get started.")
@@ -614,6 +854,28 @@ if data:
         results = st.session_state["results"]
         st.divider()
         city = detect_city(data)
+
+        # Share / export this run
+        ts_slug = datetime.now().strftime("%Y%m%d-%H%M")
+        share_col1, share_col2, _ = st.columns([1, 1, 2])
+        with share_col1:
+            st.download_button(
+                "⬇ Download JSON",
+                data=export_json(data, results, city, model),
+                file_name=f"aitaskgrader-{city}-{ts_slug}.json",
+                mime="application/json",
+                help="Reload later with the 'Load saved run' uploader in the sidebar, or share the file.",
+                use_container_width=True,
+            )
+        with share_col2:
+            st.download_button(
+                "⬇ Download HTML report",
+                data=generate_html_report(data, results, city, model),
+                file_name=f"aitaskgrader-{city}-{ts_slug}.html",
+                mime="text/html",
+                help="A standalone shareable report — opens in any browser, no app required.",
+                use_container_width=True,
+            )
 
         tab1, tab2, tab3, tab4 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict"])
 
