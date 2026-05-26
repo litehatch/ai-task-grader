@@ -37,17 +37,28 @@ st.title("AI Data Cleanup Evaluation")
 st.caption("Measure AI accuracy on real property records — task by task, backed by numbers.")
 
 def load_env_key():
+    # Check Streamlit secrets first (Cloud), then OS env var (local dev)
+    try:
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            return st.secrets["ANTHROPIC_API_KEY"]
+    except (FileNotFoundError, Exception):
+        pass
     return os.environ.get("ANTHROPIC_API_KEY", "")
+
+_env_key = load_env_key()
 
 # ── Sidebar ──
 with st.sidebar:
     st.header("Configuration")
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        value=load_env_key(),
-        help="Your key is used only for this session. Nothing is saved server-side.",
-    )
+    if _env_key:
+        api_key = _env_key
+        st.caption("✓ Demo mode — no API key required to try the live evaluation.")
+    else:
+        api_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            help="Bring your own key — used only for this session, never saved server-side.",
+        )
     model = st.selectbox("Model", ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"], index=0)
     st.divider()
 
