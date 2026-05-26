@@ -89,7 +89,7 @@ with st.sidebar:
     st.divider()
 
     st.header("Data Source")
-    source = st.radio("Choose source", ["Toronto (Open Data)", "NYC (PLUTO API)", "Vancouver (Open Data)", "Upload CSV"])
+    source = st.radio("Choose source", ["NYC (PLUTO API)", "Toronto (Open Data)", "Vancouver (Open Data)", "Upload CSV"])
 
     if source == "NYC (PLUTO API)":
         st.subheader("NYC Filters")
