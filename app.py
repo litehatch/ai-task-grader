@@ -38,11 +38,14 @@ st.title("AI Data Cleanup Evaluation")
 st.caption("Measure AI accuracy on real property records — task by task, backed by numbers.")
 
 def load_env_key():
-    # Check Streamlit secrets first (Cloud), then OS env var (local dev)
+    # Check Streamlit secrets first (Cloud), then OS env var (local dev). The
+    # secrets accessor raises a StreamlitSecretNotFoundError subclass when no
+    # secrets.toml exists; broaden to Exception so any unexpected internal error
+    # falls back to the env var rather than crashing the sidebar.
     try:
         if "ANTHROPIC_API_KEY" in st.secrets:
             return st.secrets["ANTHROPIC_API_KEY"]
-    except (FileNotFoundError, Exception):
+    except Exception:
         pass
     return os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -71,8 +74,14 @@ with st.sidebar:
                 payload = json.loads(uploaded_run.read().decode("utf-8"))
                 if not isinstance(payload, dict) or "data" not in payload or "results" not in payload:
                     raise ValueError("File missing required 'data' and 'results' fields.")
+                loaded_results = payload["results"]
+                # Address results are keyed by integer record id at write time, but JSON
+                # round-trips object keys as strings. Cast back so downstream int lookups work.
+                addrs = loaded_results.get("addresses")
+                if isinstance(addrs, dict):
+                    loaded_results["addresses"] = {int(k): v for k, v in addrs.items() if str(k).isdigit()}
                 st.session_state["data"] = payload["data"]
-                st.session_state["results"] = payload["results"]
+                st.session_state["results"] = loaded_results
                 st.session_state["data_source"] = payload.get("city", "uploaded")
                 st.success(f"Loaded {len(payload['data'])} records from {payload.get('city', 'saved run')} (generated {payload.get('generated_at', 'unknown date')[:10]}).")
             except Exception as e:
@@ -144,16 +153,30 @@ with st.sidebar:
     else:
         uploaded = st.file_uploader("Upload CSV", type=["csv"])
         st.caption("CSV must have columns: address, and optionally: zipcode, ownername, bldgclass, yearbuilt")
+        csv_city = st.selectbox(
+            "Treat records as",
+            ["Auto-detect", "NYC", "Vancouver", "Toronto"],
+            help="Auto-detect uses postal-code prefixes (V→Vancouver, M→Toronto). "
+                 "Pick explicitly if the data is from somewhere else — otherwise prompts default to NYC.",
+        )
 
 # ── Data fetching ──
+def _safe_soql_str(s):
+    """Whitelist filter inputs going into SoQL string literals: alphanumeric, space,
+    dash. Socrata has no parameterized binding for SoQL string literals, so the
+    only safe path is to refuse anything else."""
+    return re.sub(r"[^A-Za-z0-9 \-]", "", s or "").strip()
+
 def fetch_nyc_data(borough, zip_filter, street_filter, limit):
     conditions = ["address IS NOT NULL"]
     if borough != "Any":
         conditions.append(f"borough='{boro_map[borough]}'")
-    if zip_filter:
-        conditions.append(f"zipcode='{zip_filter}'")
-    if street_filter:
-        conditions.append(f"address like '%25{street_filter.upper()}%25'")
+    zip_clean = _safe_soql_str(zip_filter)
+    if zip_clean:
+        conditions.append(f"zipcode='{zip_clean}'")
+    street_clean = _safe_soql_str(street_filter).upper()
+    if street_clean:
+        conditions.append(f"address like '%25{street_clean}%25'")
     where = " AND ".join(conditions)
     params = urllib.parse.urlencode({"$limit": limit, "$where": where, "$order": "bbl", "$offset": 0})
     url = f"https://data.cityofnewyork.us/resource/64uk-42ks.json?{params}"
@@ -165,10 +188,12 @@ def fetch_vancouver_data(neighbourhood, street, postal, limit):
     code = van_neighbourhoods.get(neighbourhood)
     if code:
         conditions.append(f"neighbourhood_code='{code}'")
-    if street:
-        conditions.append(f"street_name LIKE '*{street.upper()}*'")
-    if postal:
-        conditions.append(f"property_postal_code LIKE '{postal.upper()}*'")
+    street_clean = _safe_soql_str(street).upper()
+    if street_clean:
+        conditions.append(f"street_name LIKE '*{street_clean}*'")
+    postal_clean = _safe_soql_str(postal).upper()
+    if postal_clean:
+        conditions.append(f"property_postal_code LIKE '{postal_clean}*'")
     where = " AND ".join(conditions)
     params = urllib.parse.urlencode({"limit": limit, "where": where})
     url = f"https://opendata.vancouver.ca/api/explore/v2.1/catalog/datasets/property-tax-report/records?{params}"
@@ -250,35 +275,143 @@ def fetch_toronto_data(ward_label, street, fsa, limit):
         })
     return records
 
-def parse_csv_upload(uploaded_file):
-    content = uploaded_file.read().decode("utf-8")
-    return list(csv.DictReader(io.StringIO(content)))
+def parse_csv_upload(uploaded_file, source_tag=None):
+    raw_bytes = uploaded_file.read()
+    try:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # Fall back to latin-1 so government exports with stray non-utf-8 bytes
+        # don't blow up — surface a warning to the user separately.
+        content = raw_bytes.decode("latin-1", errors="replace")
+    rows = list(csv.DictReader(io.StringIO(content)))
+    if source_tag:
+        for r in rows:
+            r["_source"] = source_tag
+    return rows
 
 # ── LLM calls ──
-def call_claude(client, prompt, model_name, max_tokens=4096):
-    resp = client.messages.create(
-        model=model_name, max_tokens=max_tokens,
-        system="You are a real estate data processing assistant. Return ONLY valid JSON, no explanation or markdown.",
-        messages=[{"role": "user", "content": prompt}],
-    )
+# Public list prices, USD per 1M tokens (input, output). Update when Anthropic re-prices.
+MODEL_PRICING = {
+    "claude-sonnet-4-6":            (3.00, 15.00),
+    "claude-haiku-4-5-20251001":    (1.00,  5.00),
+}
+BATCH_DISCOUNT = 0.5  # Anthropic Batches API: 50% off both sides.
+
+_RETRY_STATUS = {429, 500, 502, 503, 504, 529}
+_MAX_RETRIES = 4
+
+def call_claude(client, prompt, model_name, max_tokens=4096, label=None):
+    """Call Anthropic with exponential-backoff retries on transient errors.
+    Accumulates token usage and surfaces max_tokens truncation as a session warning."""
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = client.messages.create(
+                model=model_name, max_tokens=max_tokens,
+                system="You are a real estate data processing assistant. Return ONLY valid JSON, no explanation or markdown.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except anthropic.APIStatusError as e:
+            if getattr(e, "status_code", None) in _RETRY_STATUS and attempt < _MAX_RETRIES:
+                last_exc = e
+                time.sleep(min(2 ** attempt, 16))
+                continue
+            raise
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+            if attempt < _MAX_RETRIES:
+                last_exc = e
+                time.sleep(min(2 ** attempt, 16))
+                continue
+            raise
+    else:
+        if last_exc is not None:
+            raise last_exc
+
+    usage = st.session_state.setdefault("_usage", {"input_tokens": 0, "output_tokens": 0, "calls": 0})
+    usage["input_tokens"] += getattr(resp.usage, "input_tokens", 0) or 0
+    usage["output_tokens"] += getattr(resp.usage, "output_tokens", 0) or 0
+    usage["calls"] += 1
+
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        warnings = st.session_state.setdefault("_warnings", [])
+        warnings.append(
+            f"{label or 'A model call'} hit the {max_tokens}-token output cap — "
+            f"output was truncated and downstream results may be incomplete."
+        )
+
     return resp.content[0].text
 
+def compute_cost(usage, model_name, num_records):
+    """Return (actual_cost, projected_1m_batched) in USD given accumulated usage."""
+    if not usage:
+        return None, None
+    in_price, out_price = MODEL_PRICING.get(model_name, MODEL_PRICING["claude-sonnet-4-6"])
+    actual = (usage.get("input_tokens", 0) * in_price + usage.get("output_tokens", 0) * out_price) / 1_000_000
+    if not num_records or actual <= 0:
+        return actual, None
+    per_record = actual / num_records
+    projected_batched = per_record * 1_000_000 * BATCH_DISCOUNT
+    return actual, projected_batched
+
+def unit_economics_strings(results, model_name, num_records):
+    """Single source of truth for the (ai_headline, cost_footnote) pair shown in
+    both the in-app cost card and the downloadable HTML report."""
+    usage = (results.get("_usage") or {}) if isinstance(results, dict) else {}
+    actual_cost, projected = compute_cost(usage, model_name, num_records)
+    if actual_cost is None or projected is None:
+        return "—", "No usage recorded for this run — re-run the evaluation to see real cost numbers."
+    if projected < 1000:
+        headline = f"${projected:,.0f}"
+    elif projected < 10000:
+        headline = f"${projected/1000:.1f}K"
+    else:
+        headline = f"${projected/1000:,.0f}K"
+    footnote = (
+        f"This run: {usage.get('calls', 0)} API call(s), "
+        f"{usage.get('input_tokens', 0):,} in / {usage.get('output_tokens', 0):,} out tokens, "
+        f"${actual_cost:.4f} actual on {num_records} records. "
+        f"Projection assumes Anthropic Batches API ({int(BATCH_DISCOUNT*100)}% discount) at {model_name} list prices."
+    )
+    return headline, footnote
+
 def parse_json_response(text):
+    """Parse Claude's JSON output, salvaging a trailing-truncated array if needed.
+    Object-mode truncation is NOT silently recovered (we'd just produce malformed
+    JSON) — it raises so the caller can surface a real error."""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
+        text = text.rsplit("```", 1)[0].strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         if text.startswith("["):
-            last_brace = text.rfind("}")
-            if last_brace > 0:
-                return json.loads(text[:last_brace+1] + "]")
-        elif text.startswith("{"):
-            last_brace = text.rfind("}")
-            if last_brace > 0:
-                return json.loads(text[:last_brace+1])
+            # Trim back to the last complete top-level object, then close the array.
+            depth = 0
+            in_str = False
+            esc = False
+            last_complete = -1
+            for i, ch in enumerate(text):
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\" and in_str:
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        last_complete = i
+            if last_complete > 0:
+                return json.loads(text[:last_complete + 1] + "]")
         raise
 
 # ── Task prompts (adaptive to city) ──
@@ -296,13 +429,11 @@ def detect_city(records):
             return "toronto"
     return "nyc"
 
-def run_address_task(client, records, model_name):
-    city = detect_city(records)
+ADDRESS_CHUNK_SIZE = 40
 
+def _build_address_prompt(batch, city):
     if city == "toronto":
-        batch = [{"id": i+1, "raw_address": r.get("address", ""), "fsa": r.get("zipcode", ""), "ward": r.get("ward", "")}
-                 for i, r in enumerate(records)]
-        prompt = f"""Parse and standardize each Toronto address into structured components.
+        return f"""Parse and standardize each Toronto address into structured components.
 
 Rules:
 - Convert ALL CAPS to proper Title Case
@@ -317,12 +448,10 @@ Rules:
 Input records:
 {json.dumps(batch, indent=2)}
 
-Return JSON array:
+Return JSON array (one object per input id, preserving every input id):
 [{{"id": 1, "unit": "", "street_number": "12", "street_name": "The Donway E", "city": "Toronto", "province": "ON", "fsa": "M3C", "standardized": "12 The Donway E, Toronto, ON M3C", "changes": ["Title-cased street name", "Collapsed double spaces"]}}]"""
-    elif city == "vancouver":
-        batch = [{"id": i+1, "raw_address": r.get("address", ""), "postal_code": r.get("zipcode", "")}
-                 for i, r in enumerate(records)]
-        prompt = f"""Parse and standardize each Vancouver address into structured components.
+    if city == "vancouver":
+        return f"""Parse and standardize each Vancouver address into structured components.
 
 Rules:
 - Convert ALL CAPS to proper Title Case
@@ -335,12 +464,9 @@ Rules:
 Input records:
 {json.dumps(batch, indent=2)}
 
-Return JSON array:
+Return JSON array (one object per input id, preserving every input id):
 [{{"id": 1, "unit": "", "street_number": "605", "street_name": "Hamilton St", "city": "Vancouver", "province": "BC", "postal_code": "V6B 5W4", "standardized": "605 Hamilton St, Vancouver, BC V6B 5W4", "changes": ["Title-cased street name", "Abbreviated Street→St"]}}]"""
-    else:
-        batch = [{"id": i+1, "raw_address": r.get("address", ""), "borough": r.get("borough", ""),
-                  "zipcode": r.get("zipcode", "")} for i, r in enumerate(records)]
-        prompt = f"""Parse and standardize each NYC address into structured components.
+    return f"""Parse and standardize each NYC address into structured components.
 
 Rules:
 - Convert ALL CAPS to proper Title Case
@@ -354,12 +480,33 @@ Rules:
 Input records:
 {json.dumps(batch, indent=2)}
 
-Return JSON array:
+Return JSON array (one object per input id, preserving every input id):
 [{{"id": 1, "unit": "", "street_number": "325", "street_name": "Greenwich St", "city": "New York", "state": "NY", "zipcode": "10013", "standardized": "325 Greenwich St, New York, NY 10013", "changes": ["Title-cased street name", "Abbreviated Street→St"]}}]"""
 
-    raw = call_claude(client, prompt, model_name, max_tokens=8192)
-    parsed = parse_json_response(raw)
-    return {r["id"]: r for r in parsed}
+def _address_batch_for(record, city, rid):
+    if city == "toronto":
+        return {"id": rid, "raw_address": record.get("address", ""), "fsa": record.get("zipcode", ""), "ward": record.get("ward", "")}
+    if city == "vancouver":
+        return {"id": rid, "raw_address": record.get("address", ""), "postal_code": record.get("zipcode", "")}
+    return {"id": rid, "raw_address": record.get("address", ""), "borough": record.get("borough", ""), "zipcode": record.get("zipcode", "")}
+
+def run_address_task(client, records, model_name):
+    city = detect_city(records)
+    all_results = {}
+    n = len(records)
+    for start in range(0, n, ADDRESS_CHUNK_SIZE):
+        chunk = records[start:start + ADDRESS_CHUNK_SIZE]
+        batch = [_address_batch_for(r, city, start + i + 1) for i, r in enumerate(chunk)]
+        prompt = _build_address_prompt(batch, city)
+        label = f"Address chunk {start // ADDRESS_CHUNK_SIZE + 1} of {(n + ADDRESS_CHUNK_SIZE - 1) // ADDRESS_CHUNK_SIZE}"
+        raw = call_claude(client, prompt, model_name, max_tokens=8192, label=label)
+        parsed = parse_json_response(raw)
+        for r in parsed:
+            try:
+                all_results[int(r["id"])] = r
+            except (KeyError, TypeError, ValueError):
+                continue
+    return all_results
 
 def run_classification_task(client, records, model_name):
     city = detect_city(records)
@@ -407,7 +554,7 @@ Codes to decode: {json.dumps(codes)}
 Return JSON object mapping each code to its description:
 {{"D2": "Elevator Apartment, ...", "A7": "One Family, ..."}}"""
 
-    raw = call_claude(client, prompt, model_name)
+    raw = call_claude(client, prompt, model_name, max_tokens=4096, label="Classification task")
     return parse_json_response(raw)
 
 def run_verdict_task(client, results, city, num_records, model_name):
@@ -477,7 +624,7 @@ Format:
   "summary": "2-3 sentence overall narrative — what's safe to automate, what needs human review, what's blocked on investigation."
 }}"""
 
-    raw = call_claude(client, prompt, model_name)
+    raw = call_claude(client, prompt, model_name, max_tokens=8192, label="Verdict / triage queue")
     return parse_json_response(raw)
 
 # ── Verdict citation guardrail ──
@@ -745,7 +892,7 @@ Records:
 Return JSON array of issues found:
 [{{"severity": "high|medium|low", "title": "Short description", "description": "Detailed explanation", "affected_rows": [1,2,3]}}]"""
 
-    raw = call_claude(client, prompt, model_name)
+    raw = call_claude(client, prompt, model_name, max_tokens=8192, label="Quality audit")
     return parse_json_response(raw)
 
 # ── Share/export helpers ──
@@ -767,6 +914,9 @@ def generate_html_report(data, results, city, model_name):
     city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
     timestamp = datetime.now().strftime("%B %-d, %Y at %-I:%M %p")
     record_count = len(data)
+
+    # Cost numbers driven by real token usage from the run.
+    ai_headline, cost_footnote = unit_economics_strings(results, model_name, record_count)
 
     # Verdict block — triage queue (items[]) or backwards-compat tasks[]
     verdict_html = ""
@@ -976,7 +1126,7 @@ def generate_html_report(data, results, city, model_name):
     <div class="grid grid-cols-3 gap-6">
       <div>
         <div class="text-xs uppercase tracking-wider text-blue-300 font-semibold">AI pipeline</div>
-        <div class="hero-num text-4xl font-bold mt-2">$300–1K</div>
+        <div class="hero-num text-4xl font-bold mt-2">{_esc(ai_headline)}</div>
         <div class="text-sm text-gray-400 mt-1">API spend, batched</div>
         <div class="text-xs text-gray-500 mt-2">8–12 hours wall time</div>
       </div>
@@ -994,8 +1144,9 @@ def generate_html_report(data, results, city, model_name):
       </div>
     </div>
     <div class="mt-6 pt-5 border-t border-gray-700 text-sm text-gray-300">
-      <strong class="text-white">AI is 10×–500× cheaper than manual</strong> at this volume — but only worth running on items the queue tags as <em>auto-apply</em> or <em>verify</em>.
+      <strong class="text-white">AI is dramatically cheaper than manual</strong> at this volume — but only worth running on items the queue tags as <em>auto-apply</em> or <em>verify</em>.
     </div>
+    <div class="mt-3 text-xs text-gray-500 leading-relaxed">{_esc(cost_footnote)}</div>
   </section>
 
   <!-- Data Quality -->
@@ -1038,6 +1189,7 @@ if source == "NYC (PLUTO API)":
                 st.session_state["data"] = data
                 st.session_state["data_source"] = "nyc"
                 st.session_state["results"] = None
+                st.session_state["_requested_count"] = num_records
             except Exception as e:
                 st.error(f"Failed to fetch: {e}")
     if "data" in st.session_state:
@@ -1051,6 +1203,7 @@ elif source == "Vancouver (Open Data)":
                 st.session_state["data"] = data
                 st.session_state["data_source"] = "vancouver"
                 st.session_state["results"] = None
+                st.session_state["_requested_count"] = num_records
             except Exception as e:
                 st.error(f"Failed to fetch: {e}")
     if "data" in st.session_state:
@@ -1064,6 +1217,7 @@ elif source == "Toronto (Open Data)":
                 st.session_state["data"] = data
                 st.session_state["data_source"] = "toronto"
                 st.session_state["results"] = None
+                st.session_state["_requested_count"] = num_records
             except Exception as e:
                 st.error(f"Failed to fetch: {e}")
     if "data" in st.session_state:
@@ -1071,9 +1225,11 @@ elif source == "Toronto (Open Data)":
 
 else:
     if uploaded:
-        data = parse_csv_upload(uploaded)
+        _csv_source_map = {"NYC": "nyc", "Vancouver": "vancouver", "Toronto": "toronto"}
+        source_tag = _csv_source_map.get(csv_city)  # None for "Auto-detect"
+        data = parse_csv_upload(uploaded, source_tag=source_tag)
         st.session_state["data"] = data
-        st.session_state["data_source"] = "csv"
+        st.session_state["data_source"] = source_tag or "csv"
         st.session_state["results"] = None
     elif "data" in st.session_state:
         data = st.session_state["data"]
@@ -1081,6 +1237,12 @@ else:
 if data:
     src_label = st.session_state.get("data_source", "unknown").upper()
     st.success(f"**{len(data)} records loaded** from {src_label}")
+    _requested = st.session_state.get("_requested_count")
+    if _requested and len(data) < _requested:
+        st.warning(
+            f"You requested {_requested} records but the source returned only {len(data)} "
+            f"after filtering. The dataset may not have enough rows matching your filters."
+        )
 
     with st.expander("Preview raw data", expanded=False):
         city = detect_city(data)
@@ -1097,6 +1259,10 @@ if data:
 
     if st.button("Run AI Evaluation", type="primary", use_container_width=True):
         client = anthropic.Anthropic(api_key=api_key)
+        # Reset per-run token accounting and truncation warnings so cost & status
+        # reflect this run only.
+        st.session_state["_usage"] = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+        st.session_state["_warnings"] = []
         results = {}
         col1, col2, col3 = st.columns(3)
 
@@ -1151,6 +1317,10 @@ if data:
                     s.update(label="Verdict failed", state="error")
                     st.error(str(e))
 
+        # Persist usage and any truncation warnings into results so they round-trip
+        # through saved-run JSON and are available to the HTML report generator.
+        results["_usage"] = dict(st.session_state.get("_usage", {}))
+        results["_warnings"] = list(st.session_state.get("_warnings", []))
         st.session_state["results"] = results
 
     if st.session_state.get("results"):
@@ -1179,6 +1349,13 @@ if data:
                 help="A standalone shareable report — opens in any browser, no app required.",
                 use_container_width=True,
             )
+
+        run_warnings = results.get("_warnings") or []
+        if run_warnings:
+            with st.expander(f"⚠️ {len(run_warnings)} truncation warning(s) — results may be incomplete", expanded=True):
+                for w in run_warnings:
+                    st.markdown(f"- {w}")
+                st.caption("Reduce the record count, or chunked tasks will retry next run with smaller batches.")
 
         tab1, tab2, tab3, tab4 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict"])
 
@@ -1383,8 +1560,10 @@ if data:
                     if bottom_line:
                         st.info(f"**Bottom line:** {bottom_line}")
 
+                # ── Unit economics card — driven by real token usage from this run ──
+                ai_headline, cost_footnote = unit_economics_strings(results, model, len(data))
                 st.markdown(
-                    """
+                    f"""
                     <div style="
                         background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
                         border-radius: 14px;
@@ -1406,7 +1585,7 @@ if data:
                       <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 24px;">
                         <div>
                           <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.10em; text-transform: uppercase; color: #93c5fd;">AI pipeline</div>
-                          <div style="font-size: 38px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.1;">$300–1K</div>
+                          <div style="font-size: 38px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.1;">{ai_headline}</div>
                           <div style="font-size: 13px; color: #94a3b8; margin-top: 4px;">API spend, batched</div>
                           <div style="font-size: 12px; color: #64748b; margin-top: 6px;">8–12 hours wall time</div>
                         </div>
@@ -1424,9 +1603,12 @@ if data:
                         </div>
                       </div>
                       <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #334155; font-size: 14px; color: #cbd5e1; line-height: 1.55;">
-                        <strong style="color: #ffffff;">AI is 10×–500× cheaper than manual</strong> at the same volume —
+                        <strong style="color: #ffffff;">AI is dramatically cheaper than manual</strong> at the same volume —
                         but only worth running on items the queue above tags as <em style="color: #cbd5e1;">auto-apply</em> or <em style="color: #cbd5e1;">verify</em>.
                         That's the decision this harness exists to make.
+                      </div>
+                      <div style="margin-top: 14px; font-size: 11px; color: #64748b; line-height: 1.5;">
+                        {html.escape(cost_footnote)}
                       </div>
                     </div>
                     """,
