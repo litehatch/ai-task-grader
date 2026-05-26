@@ -1,5 +1,6 @@
 import streamlit as st
 import json
+import re
 import urllib.request
 import urllib.parse
 import time
@@ -455,6 +456,78 @@ Based on these actual results, produce a verdict as a JSON object with this stru
 
     raw = call_claude(client, prompt, model_name)
     return parse_json_response(raw)
+
+# ── Verdict citation guardrail ──
+# The verdict step is synthesis prose: the model summarizes the three task
+# results and cites specific row numbers as evidence. Two real failure modes
+# were observed in production runs:
+#   1. unaudited_row — the verdict cites a row that no quality finding mentions
+#      (pure fabrication).
+#   2. cross_finding_mashup — the verdict groups several rows in one sentence
+#      ("rows 3, 5, 23, 26, and 49 are missing FSA") when those rows actually
+#      belong to different findings (49 was an FSA *mismatch*, not missing).
+# This guardrail parses every row citation from the verdict prose and
+# cross-checks it against the audit's affected_rows map.
+
+_ROW_CITATION_RE = re.compile(
+    r'\b(?:row|rows|ID|IDs|id|ids)\s+([0-9][0-9,\s]*(?:and\s+[0-9]+)?)',
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r'\d+')
+
+def _extract_row_citation_groups(text):
+    groups = []
+    for m in _ROW_CITATION_RE.finditer(text or ""):
+        nums = [int(n) for n in _NUMBER_RE.findall(m.group(1))]
+        if nums:
+            groups.append(nums)
+    return groups
+
+def validate_verdict_citations(verdict, results):
+    if not isinstance(verdict, dict):
+        return []
+
+    findings_by_row = {}
+    for q in (results.get("quality") or []):
+        title = q.get("title") or "(untitled finding)"
+        for rid in (q.get("affected_rows") or []):
+            try:
+                findings_by_row.setdefault(int(rid), set()).add(title)
+            except (TypeError, ValueError):
+                continue
+    audited_rows = set(findings_by_row.keys())
+
+    sections = [(t.get("name", "task"), t.get("rationale", "") or "")
+                for t in (verdict.get("tasks") or [])]
+    sections.append(("bottom line", verdict.get("bottom_line", "") or ""))
+
+    warnings = []
+    for label, text in sections:
+        for group in _extract_row_citation_groups(text):
+            unaudited = [r for r in group if r not in audited_rows]
+            if unaudited:
+                warnings.append({
+                    "scope": label,
+                    "type": "unaudited_row",
+                    "rows": unaudited,
+                    "message": f"Cites row(s) {unaudited} in **{label}**, but no quality finding flags these rows.",
+                })
+
+            audited_in_group = [r for r in group if r in audited_rows]
+            if len(group) > 1 and audited_in_group:
+                shared = set(findings_by_row[audited_in_group[0]])
+                for r in audited_in_group[1:]:
+                    shared &= findings_by_row[r]
+                if not shared:
+                    row_to_findings = {r: sorted(findings_by_row.get(r, set())) for r in group}
+                    warnings.append({
+                        "scope": label,
+                        "type": "cross_finding_mashup",
+                        "rows": group,
+                        "row_to_findings": row_to_findings,
+                        "message": f"Groups rows {group} in **{label}**, but these rows belong to different findings.",
+                    })
+    return warnings
 
 def run_quality_task(client, records, model_name):
     city = detect_city(records)
@@ -995,6 +1068,25 @@ if data:
             city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
             verdict = results.get("verdict")
             if verdict and isinstance(verdict, dict):
+                citation_warnings = validate_verdict_citations(verdict, results)
+                if citation_warnings:
+                    with st.expander(
+                        f"⚠️ Citation guardrail flagged {len(citation_warnings)} claim(s) — review before sharing",
+                        expanded=True,
+                    ):
+                        st.caption(
+                            "Cross-checks every row number cited in the verdict against the underlying audit "
+                            "findings. Catches two real failure modes of LLM synthesis: hallucinated row IDs "
+                            "and row groupings that mix evidence from different findings."
+                        )
+                        for w in citation_warnings:
+                            st.markdown(f"- {w['message']}")
+                            r2f = w.get("row_to_findings")
+                            if r2f:
+                                for r, titles in r2f.items():
+                                    label = ", ".join(titles) if titles else "(no finding flags this row)"
+                                    st.markdown(f"    - Row {r}: {label}")
+
                 tasks = verdict.get("tasks", [])
                 if tasks:
                     st.markdown(f"**{city_label} evaluation results ({len(data)} records):**")
