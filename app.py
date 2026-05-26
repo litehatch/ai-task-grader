@@ -427,46 +427,54 @@ def run_verdict_task(client, results, city, num_records, model_name):
     }
 
     city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
-    class_task_name = {"vancouver": "Zoning Classification", "toronto": "Building Type Classification"}.get(city, "Building Classification")
     available_findings = [q.get("title", "") for q in results.get("quality", []) if q.get("title")]
-    prompt = f"""You just evaluated {num_records} real {city_label} property records with AI across three tasks. Here are the results:
+    prompt = f"""You just evaluated {num_records} real {city_label} property records with AI across three tasks.
+
+Your job now is to convert these results into a TRIAGE QUEUE for a data analyst.
+Every cleanup opportunity in this dataset — whether from address standardization,
+classification, or the quality audit — should become one item in the queue with
+a clear disposition:
+
+- "auto_apply": AI's fix is mechanical, reversible, and safe. Apply without review.
+  (e.g. title-casing addresses, expanding standard abbreviations, normalizing
+  obviously-equivalent name variants like "AKELIUS " → "AKELIUS CANADA LTD")
+- "verify": AI made a judgment call that's probably right but worth a human check.
+  (e.g. inferring a missing FSA from neighboring records, flagging a suspicious
+  registration year)
+- "hold": Issue is real but no safe automated fix exists; needs investigation.
+  (e.g. near-empty placeholder records, contradictions that could go either way)
+- "ignore": Not actionable; cosmetic or out of scope for this pipeline.
+
+Bundle bulk uniform work into a single item where appropriate
+(e.g. "Apply 50 address standardizations" → auto_apply with affected_rows = all
+records and finding = null). Do not produce one item per row for uniform work.
+
+CITATION REQUIREMENT: every row in an item's affected_rows must be supported.
+If the item is tied to a specific quality finding, set "finding" to the EXACT
+title from the list below and every affected row must actually appear in that
+finding's audit. If the item is bulk work not tied to a quality issue (e.g. the
+sweep of address standardizations), set "finding" to null.
+
+Available finding titles (use one verbatim, or null):
+{json.dumps(available_findings, indent=2)}
+
+Audit results:
 
 {json.dumps(summary, indent=2)}
 
-Based on these actual results, produce a verdict as a JSON object.
-
-CITATION REQUIREMENT: every row number you reference in a rationale or in the bottom_line
-must appear in a structured citation list with the EXACT title of the finding that supports
-it. These citations are validated against the underlying audit, so do not group rows from
-different findings together and do not cite rows that no finding actually flags.
-
-Available finding titles (use one of these verbatim, or omit the citation):
-{json.dumps(available_findings, indent=2)}
-
 Format:
 {{
-  "tasks": [
+  "items": [
     {{
-      "name": "Address Standardization",
-      "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed",
-      "cited_rows": [{{"row": 49, "finding": "exact finding title from the list above"}}]
-    }},
-    {{
-      "name": "{class_task_name}",
-      "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed",
-      "cited_rows": []
-    }},
-    {{
-      "name": "Data Quality Audit",
-      "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed",
-      "cited_rows": []
+      "title": "Short imperative — what would be done (5-10 words)",
+      "disposition": "auto_apply" | "verify" | "hold" | "ignore",
+      "proposed_fix": "What AI would do to resolve this, in one sentence",
+      "why_disposition": "Why this disposition and not another (1-2 sentences)",
+      "affected_rows": [3, 5, 23, 26],
+      "finding": "exact finding title from the list above, or null"
     }}
   ],
-  "bottom_line": "2-3 sentence overall assessment specific to this dataset — what worked, what didn't, and what a production pipeline should do differently. Reference specific findings from the data.",
-  "bottom_line_citations": [{{"row": 3, "finding": "exact finding title"}}]
+  "summary": "2-3 sentence overall narrative — what's safe to automate, what needs human review, what's blocked on investigation."
 }}"""
 
     raw = call_claude(client, prompt, model_name)
@@ -593,7 +601,64 @@ def _validate_prose_citations(verdict, findings_by_row):
                     })
     return warnings
 
-def validate_verdict_citations(verdict, results):
+def _validate_triage_items(verdict, finding_rows, num_records):
+    """Validate the triage-queue schema: each item carries affected_rows and a
+    finding title (or null). For items tied to a finding, every affected row
+    must appear in that finding's audit. For items with finding=null (e.g. bulk
+    address standardization), we still check that rows are real record IDs."""
+    warnings = []
+    for item in (verdict.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title", "(untitled item)")
+        affected = []
+        for rid in (item.get("affected_rows") or []):
+            try:
+                affected.append(int(rid))
+            except (TypeError, ValueError):
+                continue
+        if not affected:
+            continue
+
+        finding_claim = item.get("finding")
+        if finding_claim is None or finding_claim == "":
+            out_of_range = [r for r in affected if r < 1 or r > num_records]
+            if out_of_range:
+                warnings.append({
+                    "scope": title,
+                    "type": "row_out_of_range",
+                    "rows": out_of_range,
+                    "message": (f"Item **{title}** lists rows {out_of_range} that are "
+                                f"outside the {num_records}-record dataset."),
+                })
+            continue
+
+        matched = _match_finding_title(finding_claim, finding_rows)
+        if matched is None:
+            warnings.append({
+                "scope": title,
+                "type": "unknown_finding",
+                "claim": finding_claim,
+                "message": (f"Item **{title}** references finding '{finding_claim}', "
+                            f"but no such finding exists in the audit."),
+            })
+            continue
+
+        bad_rows = [r for r in affected if r not in finding_rows[matched]]
+        if bad_rows:
+            actual = sorted(finding_rows[matched])
+            warnings.append({
+                "scope": title,
+                "type": "row_not_in_finding",
+                "rows": bad_rows,
+                "claim": matched,
+                "actual_rows": actual,
+                "message": (f"Item **{title}** includes rows {bad_rows} under "
+                            f"**{matched}**, but that finding actually flags rows {actual}."),
+            })
+    return warnings
+
+def validate_verdict_citations(verdict, results, num_records=None):
     if not isinstance(verdict, dict):
         return []
 
@@ -611,9 +676,13 @@ def validate_verdict_citations(verdict, results):
         for r in rows:
             findings_by_row.setdefault(r, set()).add(title)
 
+    # Schema dispatch: new triage queue uses items[]; older runs used tasks[].
+    if verdict.get("items"):
+        n = num_records if num_records is not None else 10**9
+        return _validate_triage_items(verdict, finding_rows, n)
+
     has_structured = any(t.get("cited_rows") for t in (verdict.get("tasks") or [])) \
                      or bool(verdict.get("bottom_line_citations"))
-
     if has_structured:
         return _validate_structured_citations(verdict, finding_rows)
     return _validate_prose_citations(verdict, findings_by_row)
@@ -699,31 +768,84 @@ def generate_html_report(data, results, city, model_name):
     timestamp = datetime.now().strftime("%B %-d, %Y at %-I:%M %p")
     record_count = len(data)
 
-    # Verdict block
+    # Verdict block — triage queue (items[]) or backwards-compat tasks[]
     verdict_html = ""
     verdict = results.get("verdict")
     if verdict and isinstance(verdict, dict):
-        tasks_rows = ""
-        for t in verdict.get("tasks", []):
-            tasks_rows += f"""
-            <tr>
-              <td class="px-4 py-3 font-semibold text-sm text-gray-900 align-top">{_esc(t.get('name', ''))}</td>
-              <td class="px-4 py-3 text-sm text-gray-700 align-top">{_esc(t.get('recommendation', ''))}</td>
-              <td class="px-4 py-3 text-sm text-gray-600 align-top leading-relaxed">{_esc(t.get('rationale', ''))}</td>
-            </tr>"""
-        bottom_line = _esc(verdict.get("bottom_line", ""))
-        verdict_html = f"""
-        <div class="bg-white rounded-lg border overflow-hidden mb-4">
-          <table class="w-full">
-            <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase tracking-wider">
-              <tr><th class="px-4 py-3">Task</th><th class="px-4 py-3">Recommendation</th><th class="px-4 py-3">Rationale</th></tr>
-            </thead>
-            <tbody class="divide-y divide-gray-100">{tasks_rows}</tbody>
-          </table>
-        </div>
-        <div class="bg-blue-50 border border-blue-200 rounded-lg p-5 mb-6">
-          <p class="text-sm text-blue-900 leading-relaxed"><strong>Bottom line:</strong> {bottom_line}</p>
-        </div>"""
+        items = verdict.get("items", [])
+        if items:
+            disposition_styles = {
+                "auto_apply": ("🟢 Auto-apply", "border-emerald-300 bg-emerald-50", "bg-emerald-100 text-emerald-800"),
+                "verify":     ("🟡 Verify",     "border-amber-300 bg-amber-50",     "bg-amber-100 text-amber-800"),
+                "hold":       ("🔴 Hold",       "border-red-300 bg-red-50",         "bg-red-100 text-red-800"),
+                "ignore":     ("⚪ Ignore",     "border-gray-300 bg-gray-50",       "bg-gray-100 text-gray-700"),
+            }
+            counts = {"auto_apply": 0, "verify": 0, "hold": 0, "ignore": 0}
+            for it in items:
+                d = it.get("disposition")
+                if d in counts:
+                    counts[d] += 1
+
+            cards_html = ""
+            for disp in ("auto_apply", "verify", "hold", "ignore"):
+                matching = [it for it in items if it.get("disposition") == disp]
+                if not matching:
+                    continue
+                label, border_class, badge_class = disposition_styles[disp]
+                section_html = f'<h3 class="text-sm font-bold uppercase tracking-wider text-gray-600 mt-5 mb-2">{_esc(label)} <span class="text-gray-400 font-normal">({len(matching)})</span></h3>'
+                for it in matching:
+                    rows = it.get("affected_rows") or []
+                    finding_name = it.get("finding")
+                    finding_line = f' • finding: {_esc(finding_name)}' if finding_name else ' • bulk task'
+                    section_html += f"""
+                    <div class="border {border_class} rounded-lg p-4 mb-3">
+                      <div class="flex items-start justify-between mb-2">
+                        <p class="font-semibold text-sm text-gray-900">{_esc(it.get('title', ''))}</p>
+                        <span class="text-xs px-2 py-0.5 rounded {badge_class} ml-3 whitespace-nowrap">{_esc(label)}</span>
+                      </div>
+                      <p class="text-sm text-gray-700 mb-1"><em>Proposed fix:</em> {_esc(it.get('proposed_fix', ''))}</p>
+                      <p class="text-xs text-gray-500 mb-2">{_esc(it.get('why_disposition', ''))}</p>
+                      <p class="text-xs text-gray-400">{len(rows)} affected row(s){finding_line}</p>
+                    </div>"""
+                cards_html += section_html
+
+            metrics_html = f"""
+            <div class="grid grid-cols-4 gap-3 mb-4">
+              <div class="border border-emerald-200 bg-emerald-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-emerald-700">{counts['auto_apply']}</div><div class="text-xs text-emerald-700 uppercase tracking-wider">Auto-apply</div></div>
+              <div class="border border-amber-200 bg-amber-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-amber-700">{counts['verify']}</div><div class="text-xs text-amber-700 uppercase tracking-wider">Verify</div></div>
+              <div class="border border-red-200 bg-red-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-red-700">{counts['hold']}</div><div class="text-xs text-red-700 uppercase tracking-wider">Hold</div></div>
+              <div class="border border-gray-200 bg-gray-50 rounded-lg p-3 text-center"><div class="text-2xl font-bold text-gray-700">{counts['ignore']}</div><div class="text-xs text-gray-700 uppercase tracking-wider">Ignore</div></div>
+            </div>"""
+
+            summary_text = _esc(verdict.get("summary", "") or verdict.get("bottom_line", ""))
+            summary_html = f"""
+            <div class="bg-blue-50 border border-blue-200 rounded-lg p-5 mt-4">
+              <p class="text-sm text-blue-900 leading-relaxed"><strong>Summary:</strong> {summary_text}</p>
+            </div>""" if summary_text else ""
+
+            verdict_html = metrics_html + cards_html + summary_html
+        else:
+            tasks_rows = ""
+            for t in verdict.get("tasks", []):
+                tasks_rows += f"""
+                <tr>
+                  <td class="px-4 py-3 font-semibold text-sm text-gray-900 align-top">{_esc(t.get('name', ''))}</td>
+                  <td class="px-4 py-3 text-sm text-gray-700 align-top">{_esc(t.get('recommendation', ''))}</td>
+                  <td class="px-4 py-3 text-sm text-gray-600 align-top leading-relaxed">{_esc(t.get('rationale', ''))}</td>
+                </tr>"""
+            bottom_line = _esc(verdict.get("bottom_line", ""))
+            verdict_html = f"""
+            <div class="bg-white rounded-lg border overflow-hidden mb-4">
+              <table class="w-full">
+                <thead class="bg-gray-50 text-left text-xs text-gray-500 uppercase tracking-wider">
+                  <tr><th class="px-4 py-3">Task</th><th class="px-4 py-3">Recommendation</th><th class="px-4 py-3">Rationale</th></tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">{tasks_rows}</tbody>
+              </table>
+            </div>
+            <div class="bg-blue-50 border border-blue-200 rounded-lg p-5 mb-6">
+              <p class="text-sm text-blue-900 leading-relaxed"><strong>Bottom line:</strong> {bottom_line}</p>
+            </div>"""
 
     # Quality issues
     quality_html = ""
@@ -836,9 +958,9 @@ def generate_html_report(data, results, city, model_name):
     </div>
   </div>
 
-  <!-- Verdict -->
+  <!-- Triage Queue -->
   <section class="mb-8">
-    <h2 class="text-xl font-bold text-gray-900 mb-3">Verdict</h2>
+    <h2 class="text-xl font-bold text-gray-900 mb-3">Triage Queue</h2>
     {verdict_html or '<p class="text-gray-500 text-sm">No verdict generated.</p>'}
   </section>
 
@@ -872,7 +994,7 @@ def generate_html_report(data, results, city, model_name):
       </div>
     </div>
     <div class="mt-6 pt-5 border-t border-gray-700 text-sm text-gray-300">
-      <strong class="text-white">AI is 10×–500× cheaper than manual</strong> on the tasks the verdict above scores safe to automate.
+      <strong class="text-white">AI is 10×–500× cheaper than manual</strong> at this volume — but only worth running on items the queue tags as <em>auto-apply</em> or <em>verify</em>.
     </div>
   </section>
 
@@ -1153,11 +1275,11 @@ if data:
                                 st.dataframe(affected_rows, use_container_width=True, hide_index=True)
 
         with tab4:
-            st.subheader("Verdict")
+            st.subheader("Triage Queue")
             city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
             verdict = results.get("verdict")
             if verdict and isinstance(verdict, dict):
-                citation_warnings = validate_verdict_citations(verdict, results)
+                citation_warnings = validate_verdict_citations(verdict, results, num_records=len(data))
                 if citation_warnings:
                     with st.expander(
                         f"⚠️ Citation guardrail flagged {len(citation_warnings)} claim(s) — review before sharing",
@@ -1165,8 +1287,8 @@ if data:
                     ):
                         st.caption(
                             "Cross-checks every row number cited in the verdict against the underlying audit "
-                            "findings. Catches two real failure modes of LLM synthesis: hallucinated row IDs "
-                            "and row groupings that mix evidence from different findings."
+                            "findings. Catches two real failure modes of LLM synthesis: row IDs attributed to "
+                            "the wrong finding, and references to findings that don't exist."
                         )
                         for w in citation_warnings:
                             st.markdown(f"- {w['message']}")
@@ -1176,16 +1298,90 @@ if data:
                                     label = ", ".join(titles) if titles else "(no finding flags this row)"
                                     st.markdown(f"    - Row {r}: {label}")
 
-                tasks = verdict.get("tasks", [])
-                if tasks:
-                    st.markdown(f"**{city_label} evaluation results ({len(data)} records):**")
-                    table_md = "| Task | Recommendation | Rationale |\n|------|---------------|----------|\n"
-                    for t in tasks:
-                        table_md += f"| **{t.get('name', '')}** | {t.get('recommendation', '')} | {t.get('rationale', '')} |\n"
-                    st.markdown(table_md)
-                bottom_line = verdict.get("bottom_line", "")
-                if bottom_line:
-                    st.info(f"**Bottom line:** {bottom_line}")
+                items = verdict.get("items", [])
+                if items:
+                    st.caption(f"AI scanned {len(data)} {city_label} records and proposed {len(items)} cleanup action(s). "
+                               f"Each item is tagged with how much human review it needs before applying.")
+
+                    counts = {"auto_apply": 0, "verify": 0, "hold": 0, "ignore": 0}
+                    for it in items:
+                        d = it.get("disposition")
+                        if d in counts:
+                            counts[d] += 1
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("🟢 Auto-apply", counts["auto_apply"])
+                    m2.metric("🟡 Verify", counts["verify"])
+                    m3.metric("🔴 Hold", counts["hold"])
+                    m4.metric("⚪ Ignore", counts["ignore"])
+
+                    disposition_meta = [
+                        ("auto_apply", "🟢 Auto-apply", "AI can make these fixes without human review."),
+                        ("verify",     "🟡 Verify",     "AI made a judgment call — a human should confirm before applying."),
+                        ("hold",       "🔴 Hold",       "Real issue, but no safe automated fix — needs investigation."),
+                        ("ignore",     "⚪ Ignore",     "Not actionable in this pipeline."),
+                    ]
+
+                    finding_lookup = {(q.get("title") or ""): q for q in (results.get("quality") or [])}
+
+                    for disp, label, blurb in disposition_meta:
+                        matching = [it for it in items if it.get("disposition") == disp]
+                        if not matching:
+                            continue
+                        st.markdown(f"### {label}")
+                        st.caption(blurb)
+                        for it in matching:
+                            st.markdown(f"**{it.get('title', '')}**")
+                            fix = it.get("proposed_fix", "")
+                            if fix:
+                                st.markdown(f"*Proposed fix:* {fix}")
+                            why = it.get("why_disposition", "")
+                            if why:
+                                st.caption(why)
+                            affected = it.get("affected_rows") or []
+                            finding_name = it.get("finding")
+                            with st.expander(
+                                f"Evidence — {len(affected)} affected row(s)"
+                                + (f" • finding: {finding_name}" if finding_name else " • bulk task"),
+                                expanded=False,
+                            ):
+                                if affected:
+                                    rows_to_show = []
+                                    for idx, rec in enumerate(data):
+                                        if (idx + 1) in affected:
+                                            row = {"#": idx + 1}
+                                            for c in ("address", "zipcode", "ward", "bldgclass", "yearbuilt",
+                                                      "year_registered", "confirmed_units", "confirmed_storeys",
+                                                      "heating_type", "ownername"):
+                                                v = rec.get(c)
+                                                if v not in (None, ""):
+                                                    row[c] = v
+                                            rows_to_show.append(row)
+                                    if rows_to_show:
+                                        st.dataframe(rows_to_show, use_container_width=True, hide_index=True)
+                                if finding_name and finding_name in finding_lookup:
+                                    src = finding_lookup[finding_name]
+                                    desc = src.get("description", "")
+                                    if desc:
+                                        st.caption(f"Source finding ({src.get('severity', '?')}): {desc}")
+                            st.divider()
+
+                    summary_text = verdict.get("summary", "") or verdict.get("bottom_line", "")
+                    if summary_text:
+                        st.info(f"**Summary:** {summary_text}")
+
+                else:
+                    # Backwards compat: render older saved runs that used the tasks[] schema.
+                    tasks = verdict.get("tasks", [])
+                    if tasks:
+                        st.caption("Loaded a saved run from an earlier schema. Re-run the evaluation to see the triage queue view.")
+                        st.markdown(f"**{city_label} evaluation results ({len(data)} records):**")
+                        table_md = "| Task | Recommendation | Rationale |\n|------|---------------|----------|\n"
+                        for t in tasks:
+                            table_md += f"| **{t.get('name', '')}** | {t.get('recommendation', '')} | {t.get('rationale', '')} |\n"
+                        st.markdown(table_md)
+                    bottom_line = verdict.get("bottom_line", "")
+                    if bottom_line:
+                        st.info(f"**Bottom line:** {bottom_line}")
 
                 st.markdown(
                     """
@@ -1228,8 +1424,8 @@ if data:
                         </div>
                       </div>
                       <div style="margin-top: 24px; padding-top: 18px; border-top: 1px solid #334155; font-size: 14px; color: #cbd5e1; line-height: 1.55;">
-                        <strong style="color: #ffffff;">AI is 10×–500× cheaper than manual</strong> for the same volume —
-                        but only worth deploying on tasks the verdict above scores as <em style="color: #cbd5e1;">automate</em> or <em style="color: #cbd5e1;">human-in-loop</em>.
+                        <strong style="color: #ffffff;">AI is 10×–500× cheaper than manual</strong> at the same volume —
+                        but only worth running on items the queue above tags as <em style="color: #cbd5e1;">auto-apply</em> or <em style="color: #cbd5e1;">verify</em>.
                         That's the decision this harness exists to make.
                       </div>
                     </div>
