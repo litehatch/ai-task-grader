@@ -22,6 +22,14 @@ st.markdown("""
     .block-container { max-width: 1100px; }
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     div[data-testid="stMetric"] { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; }
+    /* Hide Streamlit Cloud branding for a cleaner app look */
+    [data-testid="stToolbar"] { display: none !important; }
+    [data-testid="stDecoration"] { display: none !important; }
+    [data-testid="stStatusWidget"] { display: none !important; }
+    .stDeployButton { display: none !important; }
+    #MainMenu { visibility: hidden !important; }
+    footer { visibility: hidden !important; }
+    header { background: transparent !important; }
 </style>
 """, unsafe_allow_html=True)
 
