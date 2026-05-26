@@ -428,30 +428,45 @@ def run_verdict_task(client, results, city, num_records, model_name):
 
     city_label = {"vancouver": "Vancouver", "toronto": "Toronto"}.get(city, "NYC")
     class_task_name = {"vancouver": "Zoning Classification", "toronto": "Building Type Classification"}.get(city, "Building Classification")
+    available_findings = [q.get("title", "") for q in results.get("quality", []) if q.get("title")]
     prompt = f"""You just evaluated {num_records} real {city_label} property records with AI across three tasks. Here are the results:
 
 {json.dumps(summary, indent=2)}
 
-Based on these actual results, produce a verdict as a JSON object with this structure:
+Based on these actual results, produce a verdict as a JSON object.
+
+CITATION REQUIREMENT: every row number you reference in a rationale or in the bottom_line
+must appear in a structured citation list with the EXACT title of the finding that supports
+it. These citations are validated against the underlying audit, so do not group rows from
+different findings together and do not cite rows that no finding actually flags.
+
+Available finding titles (use one of these verbatim, or omit the citation):
+{json.dumps(available_findings, indent=2)}
+
+Format:
 {{
   "tasks": [
     {{
       "name": "Address Standardization",
       "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed"
+      "rationale": "one sentence based on what you actually observed",
+      "cited_rows": [{{"row": 49, "finding": "exact finding title from the list above"}}]
     }},
     {{
       "name": "{class_task_name}",
       "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed"
+      "rationale": "one sentence based on what you actually observed",
+      "cited_rows": []
     }},
     {{
       "name": "Data Quality Audit",
       "recommendation": "short recommendation (3-6 words)",
-      "rationale": "one sentence based on what you actually observed"
+      "rationale": "one sentence based on what you actually observed",
+      "cited_rows": []
     }}
   ],
-  "bottom_line": "2-3 sentence overall assessment specific to this dataset — what worked, what didn't, and what a production pipeline should do differently. Reference specific findings from the data."
+  "bottom_line": "2-3 sentence overall assessment specific to this dataset — what worked, what didn't, and what a production pipeline should do differently. Reference specific findings from the data.",
+  "bottom_line_citations": [{{"row": 3, "finding": "exact finding title"}}]
 }}"""
 
     raw = call_claude(client, prompt, model_name)
@@ -461,13 +476,16 @@ Based on these actual results, produce a verdict as a JSON object with this stru
 # The verdict step is synthesis prose: the model summarizes the three task
 # results and cites specific row numbers as evidence. Two real failure modes
 # were observed in production runs:
-#   1. unaudited_row — the verdict cites a row that no quality finding mentions
-#      (pure fabrication).
-#   2. cross_finding_mashup — the verdict groups several rows in one sentence
-#      ("rows 3, 5, 23, 26, and 49 are missing FSA") when those rows actually
-#      belong to different findings (49 was an FSA *mismatch*, not missing).
-# This guardrail parses every row citation from the verdict prose and
-# cross-checks it against the audit's affected_rows map.
+#   1. unknown_finding — the verdict cites a finding title that doesn't exist
+#      in the audit (pure fabrication).
+#   2. row_not_in_finding — the verdict attributes a row to a finding whose
+#      affected_rows doesn't include it (e.g. citing row 49 as "missing FSA"
+#      when row 49 was actually flagged for an FSA *mismatch*, not missing).
+#
+# Primary validation uses STRUCTURED citations the prompt now requires — each
+# {row, finding} pair is checked deterministically against affected_rows. A
+# regex fallback runs on the rationale prose for older saved runs that don't
+# include the structured fields.
 
 _ROW_CITATION_RE = re.compile(
     r'\b(?:row|rows|ID|IDs|id|ids)\s+([0-9][0-9,\s]*(?:and\s+[0-9]+)?)',
@@ -483,20 +501,66 @@ def _extract_row_citation_groups(text):
             groups.append(nums)
     return groups
 
-def validate_verdict_citations(verdict, results):
-    if not isinstance(verdict, dict):
-        return []
+def _match_finding_title(claim, finding_rows):
+    """Match a model-provided finding string to a real audit title.
+    Tries exact, case-insensitive, then bidirectional substring."""
+    if not claim:
+        return None
+    if claim in finding_rows:
+        return claim
+    lower = claim.lower().strip()
+    for title in finding_rows:
+        if title.lower().strip() == lower:
+            return title
+    for title in finding_rows:
+        tl = title.lower()
+        if lower and (lower in tl or tl in lower):
+            return title
+    return None
 
-    findings_by_row = {}
-    for q in (results.get("quality") or []):
-        title = q.get("title") or "(untitled finding)"
-        for rid in (q.get("affected_rows") or []):
+def _validate_structured_citations(verdict, finding_rows):
+    """Validate explicit {row, finding} citations from the model."""
+    warnings = []
+
+    def check(scope, citations):
+        for c in citations or []:
+            if not isinstance(c, dict):
+                continue
             try:
-                findings_by_row.setdefault(int(rid), set()).add(title)
+                row = int(c.get("row"))
             except (TypeError, ValueError):
                 continue
-    audited_rows = set(findings_by_row.keys())
+            claim = (c.get("finding") or "").strip()
+            matched = _match_finding_title(claim, finding_rows)
+            if matched is None:
+                warnings.append({
+                    "scope": scope,
+                    "type": "unknown_finding",
+                    "row": row,
+                    "claim": claim,
+                    "message": (f"Cites row {row} under finding '{claim}' in **{scope}**, "
+                                f"but no such finding exists in the audit."),
+                })
+            elif row not in finding_rows[matched]:
+                actual = sorted(finding_rows[matched])
+                warnings.append({
+                    "scope": scope,
+                    "type": "row_not_in_finding",
+                    "row": row,
+                    "claim": matched,
+                    "actual_rows": actual,
+                    "message": (f"Cites row {row} under **{matched}** in {scope}, "
+                                f"but that finding actually flags rows {actual}."),
+                })
 
+    for t in (verdict.get("tasks") or []):
+        check(t.get("name", "task"), t.get("cited_rows"))
+    check("bottom line", verdict.get("bottom_line_citations"))
+    return warnings
+
+def _validate_prose_citations(verdict, findings_by_row):
+    """Regex fallback: scan rationale/bottom_line prose for row references."""
+    audited_rows = set(findings_by_row.keys())
     sections = [(t.get("name", "task"), t.get("rationale", "") or "")
                 for t in (verdict.get("tasks") or [])]
     sections.append(("bottom line", verdict.get("bottom_line", "") or ""))
@@ -528,6 +592,31 @@ def validate_verdict_citations(verdict, results):
                         "message": f"Groups rows {group} in **{label}**, but these rows belong to different findings.",
                     })
     return warnings
+
+def validate_verdict_citations(verdict, results):
+    if not isinstance(verdict, dict):
+        return []
+
+    finding_rows = {}      # title -> set of affected row IDs
+    findings_by_row = {}   # row ID -> set of finding titles
+    for q in (results.get("quality") or []):
+        title = q.get("title") or "(untitled finding)"
+        rows = set()
+        for rid in (q.get("affected_rows") or []):
+            try:
+                rows.add(int(rid))
+            except (TypeError, ValueError):
+                continue
+        finding_rows[title] = rows
+        for r in rows:
+            findings_by_row.setdefault(r, set()).add(title)
+
+    has_structured = any(t.get("cited_rows") for t in (verdict.get("tasks") or [])) \
+                     or bool(verdict.get("bottom_line_citations"))
+
+    if has_structured:
+        return _validate_structured_citations(verdict, finding_rows)
+    return _validate_prose_citations(verdict, findings_by_row)
 
 def run_quality_task(client, records, model_name):
     city = detect_city(records)
