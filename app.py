@@ -301,16 +301,23 @@ BATCH_DISCOUNT = 0.5  # Anthropic Batches API: 50% off both sides.
 _RETRY_STATUS = {429, 500, 502, 503, 504, 529}
 _MAX_RETRIES = 4
 
-def call_claude(client, prompt, model_name, max_tokens=4096, label=None):
+def call_claude(client, prompt, model_name, max_tokens=4096, label=None, prefill=None):
     """Call Anthropic with exponential-backoff retries on transient errors.
-    Accumulates token usage and surfaces max_tokens truncation as a session warning."""
+    Accumulates token usage and surfaces max_tokens truncation as a session warning.
+
+    `prefill` (optional): a string to seed the assistant's response. Forces the
+    model to continue from that prefix — useful for structured-output tasks
+    where you want to guarantee valid JSON (prefill="{" or "[")."""
     last_exc = None
+    messages = [{"role": "user", "content": prompt}]
+    if prefill:
+        messages.append({"role": "assistant", "content": prefill})
     for attempt in range(_MAX_RETRIES + 1):
         try:
             resp = client.messages.create(
                 model=model_name, max_tokens=max_tokens,
                 system="You are a real estate data processing assistant. Return ONLY valid JSON, no explanation or markdown.",
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
             )
             break
         except anthropic.APIStatusError as e:
@@ -341,7 +348,13 @@ def call_claude(client, prompt, model_name, max_tokens=4096, label=None):
             f"output was truncated and downstream results may be incomplete."
         )
 
-    return resp.content[0].text
+    body = resp.content[0].text
+    # If we prefilled the assistant turn, the model's response continues from
+    # that prefix — but the SDK returns only what the MODEL generated, NOT the
+    # prefill itself. Re-attach the prefill so the caller sees the full intended JSON.
+    if prefill:
+        return prefill + body
+    return body
 
 def compute_cost(usage, model_name, num_records):
     """Return (actual_cost, projected_1m_batched) in USD given accumulated usage."""
@@ -1096,15 +1109,16 @@ Return JSON. Use this COMPACT schema where each conflict is a 4-tuple [field, a_
 }}"""
 
     # Generous output budget: ~16K tokens accommodates 50+ matched pairs with
-    # conflict tuples plus orphans plus prose summary.
-    raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation")
+    # conflict tuples plus orphans plus prose summary. Prefill the assistant
+    # response with `{` to force structurally-valid JSON output — eliminates
+    # the empty-response and trailing-prose failure modes.
+    raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation", prefill="{")
     text = (raw or "").strip()
-    if not text:
-        # Empty response — retry once. Models occasionally emit nothing on
-        # complex structured-output tasks; a second attempt usually succeeds.
-        raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation (retry)")
+    if not text or text == "{":
+        # Empty response after prefill — retry once. Rare with prefill but possible.
+        raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation (retry)", prefill="{")
         text = (raw or "").strip()
-        if not text:
+        if not text or text == "{":
             raise ValueError("Reconciliation returned empty output twice in a row — try fewer records or switch to Haiku.")
 
     parsed = parse_json_response(text)
