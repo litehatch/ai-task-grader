@@ -380,10 +380,15 @@ def parse_json_response(text):
     """Parse Claude's JSON output, salvaging a trailing-truncated array if needed.
     Object-mode truncation is NOT silently recovered (we'd just produce malformed
     JSON) — it raises so the caller can surface a real error."""
-    text = text.strip()
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Model returned an empty response — the output may have been truncated or the request was too large.")
     if text.startswith("```"):
-        text = text.split("\n", 1)[1]
+        parts = text.split("\n", 1)
+        text = parts[1] if len(parts) > 1 else ""
         text = text.rsplit("```", 1)[0].strip()
+    if not text:
+        raise ValueError("Model returned only an empty code fence — the output may have been truncated.")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -1041,50 +1046,73 @@ def _trim_for_reconciliation(records, is_b=False):
     return out
 
 def run_reconciliation_task(client, records_a, records_b, model_name):
-    """LLM-driven entity resolution between two record sets."""
+    """LLM-driven entity resolution between two record sets. Uses a compact
+    output schema (tuple-style conflicts) to keep output well under max_tokens
+    even at 50+ matched pairs. Retries once on empty response."""
     a_trim = _trim_for_reconciliation(records_a, is_b=False)
     b_trim = _trim_for_reconciliation(records_b, is_b=True)
 
     prompt = f"""You are reconciling two property record sets from independent upstream sources during a data-pipeline merge.
 Source A is the canonical pipeline. Source B is a newly-acquired feed that describes many of the same physical properties but may use different formatting, contain typos, or drop/add records.
 
-For each record in Source B, decide:
-1. Does it match a Source A record (same underlying physical property)?
-2. If yes — which A record, and what fields conflict?
-3. If no — it's a B-orphan (new property not in A).
+For each Source B record, decide:
+1. Does it match a Source A record (same underlying physical property)? If yes, which A id, and what fields conflict?
+2. If no match — it's a B-orphan (new property not in A).
+For each A record not matched by any B record: it's an A-orphan.
 
-For each A record not matched by any B record: it's an A-orphan (in main pipeline, missing from acquired feed).
-
-Tolerate these realistic upstream drifts:
-- Address abbreviations (St↔Street, Ave↔Avenue, Rd↔Road) and casing variation
-- Owner-name format variations (LLC casing, Title vs UPPER) and single-character typos
-- yearbuilt ±1 (data entry variation) — treat as the same property
+Tolerate realistic upstream drift:
+- Address abbreviations (St↔Street, Ave↔Avenue, Rd↔Road) and casing
+- Owner-name format variations and single-character typos
+- yearbuilt ±1 (data-entry variation) — same property
 - Missing zipcode on one side
-- Minor field-by-field differences
 
-Rate each conflict's severity:
-- "trivial": cosmetic only (case, abbreviations) — safe to auto-merge using canonical rules
-- "minor": small disagreement, probably same value (yearbuilt off by 1, different owner-name casing) — human verify
-- "major": factually contradictory (yearbuilt off by 10+, completely different bldgclass) — human hold
+Conflict severity:
+- "trivial": cosmetic only (case, abbreviations) → auto-merge
+- "minor": small disagreement, probably same value → verify
+- "major": factually contradictory → hold
 
 Source A ({len(a_trim)} records):
-{json.dumps(a_trim, indent=2)}
+{json.dumps(a_trim)}
 
 Source B ({len(b_trim)} records):
-{json.dumps(b_trim, indent=2)}
+{json.dumps(b_trim)}
 
-Return JSON:
+Return JSON. Use this COMPACT schema where each conflict is a 4-tuple [field, a_value, b_value, severity]:
 {{
   "matched_pairs": [
-    {{"a_id": 1, "b_id": 17, "confidence": "high|medium|low", "conflicts": [{{"field": "yearbuilt", "a_value": "1915", "b_value": "1914", "severity": "trivial|minor|major"}}]}}
+    {{"a_id": 1, "b_id": 17, "confidence": "high", "conflicts": [["yearbuilt", "1915", "1914", "minor"]]}}
   ],
   "a_orphans": [3, 8],
   "b_orphans": [22, 31],
-  "summary": "2-3 sentences — match rate, conflict distribution, what needs human attention vs what auto-merges."
+  "summary": "2-3 sentences — match rate, conflict distribution, what needs human attention."
 }}"""
 
-    raw = call_claude(client, prompt, model_name, max_tokens=8192, label="Pipeline merge / reconciliation")
-    return parse_json_response(raw)
+    # Generous output budget: ~16K tokens accommodates 50+ matched pairs with
+    # conflict tuples plus orphans plus prose summary.
+    raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation")
+    text = (raw or "").strip()
+    if not text:
+        # Empty response — retry once. Models occasionally emit nothing on
+        # complex structured-output tasks; a second attempt usually succeeds.
+        raw = call_claude(client, prompt, model_name, max_tokens=16384, label="Pipeline merge / reconciliation (retry)")
+        text = (raw or "").strip()
+        if not text:
+            raise ValueError("Reconciliation returned empty output twice in a row — try fewer records or switch to Haiku.")
+
+    parsed = parse_json_response(text)
+
+    # Normalize compact tuple-conflicts back to dict form for downstream consumers
+    for pair in (parsed.get("matched_pairs") or []):
+        normalized = []
+        for c in (pair.get("conflicts") or []):
+            if isinstance(c, list) and len(c) >= 4:
+                normalized.append({
+                    "field": c[0], "a_value": c[1], "b_value": c[2], "severity": c[3]
+                })
+            elif isinstance(c, dict):
+                normalized.append(c)
+        pair["conflicts"] = normalized
+    return parsed
 
 def score_reconciliation(reconciliation, source_b):
     """Score the LLM's reconciliation against the hidden ground truth in source_b.
@@ -1623,7 +1651,8 @@ if data:
                             st.session_state["results"] = results
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Pipeline merge failed: {e}")
+                        st.error(f"Pipeline merge failed: {type(e).__name__}: {e}")
+                        st.caption("If this is the first run after a deploy, try once more — the model occasionally returns empty output on complex structured tasks and the retry path may help.")
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict", "Pipeline Merge"])
 
