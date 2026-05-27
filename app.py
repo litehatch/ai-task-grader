@@ -17,7 +17,7 @@ except ImportError:
     st.error("Run: pip install anthropic")
     st.stop()
 
-st.set_page_config(page_title="AI Data Cleanup Evaluation", layout="wide")
+st.set_page_config(page_title="Should AI Clean Your Property Data?", layout="wide")
 
 st.markdown("""
 <style>
@@ -35,8 +35,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("AI Data Cleanup Evaluation")
-st.caption("Measure AI accuracy on real property records — task by task, backed by numbers.")
+st.title("Should AI Clean Your Property Data?")
+st.caption("Run real property records through three AI tasks. See which findings to auto-apply, which to verify, which to hold — and what it costs at scale.")
 
 def load_env_key():
     # Check Streamlit secrets first (Cloud), then OS env var (local dev). The
