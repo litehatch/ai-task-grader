@@ -320,6 +320,15 @@ def call_claude(client, prompt, model_name, max_tokens=4096, label=None, prefill
                 messages=messages,
             )
             break
+        except anthropic.BadRequestError as e:
+            # Some models reject assistant-message prefill. Drop it and retry —
+            # the model then has to emit a complete JSON document itself instead
+            # of continuing from our seed.
+            if prefill and "prefill" in str(e).lower():
+                messages = [{"role": "user", "content": prompt}]
+                prefill = None
+                continue
+            raise
         except anthropic.APIStatusError as e:
             if getattr(e, "status_code", None) in _RETRY_STATUS and attempt < _MAX_RETRIES:
                 last_exc = e
