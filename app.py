@@ -392,6 +392,14 @@ def parse_json_response(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        # If the failure is "Extra data" (valid JSON followed by trailing prose
+        # or a second value), consume just the first JSON value and ignore the
+        # rest. This is a common failure mode on complex structured tasks.
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(text)
+            return parsed
+        except json.JSONDecodeError:
+            pass
         if text.startswith("["):
             # Trim back to the last complete top-level object, then close the array.
             depth = 0
