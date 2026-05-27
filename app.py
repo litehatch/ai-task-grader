@@ -8,6 +8,7 @@ import os
 import csv
 import io
 import html
+import random
 from datetime import datetime
 
 try:
@@ -895,6 +896,243 @@ Return JSON array of issues found:
     raw = call_claude(client, prompt, model_name, max_tokens=8192, label="Quality audit")
     return parse_json_response(raw)
 
+# ── Pipeline Merge / Reconciliation ──
+# Demonstrates the integration-day problem: merging a newly-acquired data feed
+# (Source B) with an existing pipeline (Source A) when the same physical
+# properties appear with field-level inconsistencies. This is the Constellation-
+# ID problem in miniature — entity resolution under realistic upstream drift.
+
+_ABBREV_SWAPS = {
+    "ST": "STREET", "STREET": "ST",
+    "AVE": "AVENUE", "AVENUE": "AVE",
+    "BLVD": "BOULEVARD", "BOULEVARD": "BLVD",
+    "RD": "ROAD", "ROAD": "RD",
+    "DR": "DRIVE", "DRIVE": "DR",
+    "PL": "PLACE", "PLACE": "PL",
+    "CT": "COURT", "COURT": "CT",
+    "LN": "LANE", "LANE": "LN",
+    "CRES": "CRESCENT", "CRESCENT": "CRES",
+}
+
+def _perturb_address(addr, rng):
+    if not addr:
+        return addr
+    parts = str(addr).upper().split()
+    for i, p in enumerate(parts):
+        if p in _ABBREV_SWAPS and rng.random() < 0.5:
+            parts[i] = _ABBREV_SWAPS[p]
+            break
+    out = " ".join(parts)
+    r = rng.random()
+    if r < 0.35:
+        out = out.title()
+    # 4% chance of single-letter transposition typo
+    if rng.random() < 0.04:
+        letters = [i for i, c in enumerate(out) if c.isalpha() and i + 1 < len(out) and out[i+1].isalpha()]
+        if letters:
+            i = rng.choice(letters)
+            out = out[:i] + out[i+1] + out[i] + out[i+2:]
+    return out
+
+def _perturb_year(y, rng):
+    try:
+        n = int(str(y).strip())
+    except (TypeError, ValueError):
+        return y
+    if n < 1700 or n > 2030:
+        return y
+    r = rng.random()
+    if r < 0.75:
+        return str(n)
+    if r < 0.92:
+        return str(n + rng.choice([-1, 1]))
+    return str(n + rng.choice([-10, -5, 5, 10]))
+
+def _perturb_name(name, rng):
+    if not name:
+        return name
+    out = str(name)
+    r = rng.random()
+    if r < 0.25:
+        out = out.title()
+    elif r < 0.45:
+        out = out.lower()
+    if "LLC" in out.upper() and rng.random() < 0.25:
+        out = re.sub(r"\bLLC\b", "llc", out, flags=re.IGNORECASE)
+    return out
+
+def synthesize_source_b(records, seed=42):
+    """Deterministically generate a synthetic 'Source B' from Source A records,
+    simulating an acquired-feed scenario with realistic field-level drift.
+
+    Returns (source_b_records, dropped_a_indices, novel_b_ids). The hidden
+    `_b_source_a_id` on each B record is ground truth for scoring; it is NOT
+    sent to the LLM at reconciliation time."""
+    rng = random.Random(seed)
+    n = len(records)
+    if n == 0:
+        return [], [], []
+
+    indices = list(range(n))
+    rng.shuffle(indices)
+    drop_count = max(1, int(round(n * 0.15)))
+    dropped = set(indices[:drop_count])
+
+    source_b = []
+    next_id = 1
+
+    for i, r in enumerate(records):
+        if i in dropped:
+            continue
+        new_rec = dict(r)
+        if "address" in new_rec:
+            new_rec["address"] = _perturb_address(new_rec.get("address", ""), rng)
+        if "ownername" in new_rec:
+            new_rec["ownername"] = _perturb_name(new_rec.get("ownername", ""), rng)
+        if "yearbuilt" in new_rec:
+            new_rec["yearbuilt"] = _perturb_year(new_rec.get("yearbuilt", ""), rng)
+        if "zipcode" in new_rec and rng.random() < 0.08:
+            new_rec["zipcode"] = ""
+        new_rec["_b_source_a_id"] = i + 1  # ground truth, kept hidden from LLM
+        new_rec["_b_id"] = next_id
+        next_id += 1
+        source_b.append(new_rec)
+
+    # ~15% novel B-orphans: plausible-looking records that don't exist in A
+    add_count = max(1, int(round(n * 0.15)))
+    novel_ids = []
+    for _ in range(add_count):
+        template = dict(rng.choice(records))
+        addr = template.get("address", "")
+        if addr:
+            parts = str(addr).split()
+            if parts and parts[0].isdigit():
+                try:
+                    bump = rng.choice([-300, -200, -100, 100, 200, 300, 500])
+                    new_num = max(1, int(parts[0]) + bump)
+                    parts[0] = str(new_num)
+                    template["address"] = " ".join(parts)
+                except (ValueError, TypeError):
+                    pass
+        # Also perturb the owner so it doesn't look like a known entity
+        if "ownername" in template:
+            template["ownername"] = _perturb_name(template.get("ownername", ""), rng)
+        template["_b_source_a_id"] = None
+        template["_b_id"] = next_id
+        novel_ids.append(next_id)
+        next_id += 1
+        source_b.append(template)
+
+    rng.shuffle(source_b)
+    return source_b, sorted(dropped), novel_ids
+
+def _trim_for_reconciliation(records, is_b=False):
+    """Project to essential reconciliation fields. Strip ground-truth markers."""
+    essential = ["address", "zipcode", "ownername", "bldgclass", "yearbuilt", "ward"]
+    out = []
+    for i, r in enumerate(records):
+        rid = r.get("_b_id") if is_b else i + 1
+        item = {"id": rid}
+        for k in essential:
+            v = r.get(k)
+            if v not in (None, ""):
+                item[k] = v
+        out.append(item)
+    return out
+
+def run_reconciliation_task(client, records_a, records_b, model_name):
+    """LLM-driven entity resolution between two record sets."""
+    a_trim = _trim_for_reconciliation(records_a, is_b=False)
+    b_trim = _trim_for_reconciliation(records_b, is_b=True)
+
+    prompt = f"""You are reconciling two property record sets from independent upstream sources during a data-pipeline merge.
+Source A is the canonical pipeline. Source B is a newly-acquired feed that describes many of the same physical properties but may use different formatting, contain typos, or drop/add records.
+
+For each record in Source B, decide:
+1. Does it match a Source A record (same underlying physical property)?
+2. If yes — which A record, and what fields conflict?
+3. If no — it's a B-orphan (new property not in A).
+
+For each A record not matched by any B record: it's an A-orphan (in main pipeline, missing from acquired feed).
+
+Tolerate these realistic upstream drifts:
+- Address abbreviations (St↔Street, Ave↔Avenue, Rd↔Road) and casing variation
+- Owner-name format variations (LLC casing, Title vs UPPER) and single-character typos
+- yearbuilt ±1 (data entry variation) — treat as the same property
+- Missing zipcode on one side
+- Minor field-by-field differences
+
+Rate each conflict's severity:
+- "trivial": cosmetic only (case, abbreviations) — safe to auto-merge using canonical rules
+- "minor": small disagreement, probably same value (yearbuilt off by 1, different owner-name casing) — human verify
+- "major": factually contradictory (yearbuilt off by 10+, completely different bldgclass) — human hold
+
+Source A ({len(a_trim)} records):
+{json.dumps(a_trim, indent=2)}
+
+Source B ({len(b_trim)} records):
+{json.dumps(b_trim, indent=2)}
+
+Return JSON:
+{{
+  "matched_pairs": [
+    {{"a_id": 1, "b_id": 17, "confidence": "high|medium|low", "conflicts": [{{"field": "yearbuilt", "a_value": "1915", "b_value": "1914", "severity": "trivial|minor|major"}}]}}
+  ],
+  "a_orphans": [3, 8],
+  "b_orphans": [22, 31],
+  "summary": "2-3 sentences — match rate, conflict distribution, what needs human attention vs what auto-merges."
+}}"""
+
+    raw = call_claude(client, prompt, model_name, max_tokens=8192, label="Pipeline merge / reconciliation")
+    return parse_json_response(raw)
+
+def score_reconciliation(reconciliation, source_b):
+    """Score the LLM's reconciliation against the hidden ground truth in source_b.
+    Returns dict with correct_matches, false_matches, missed_matches, orphan_recall."""
+    if not isinstance(reconciliation, dict):
+        return None
+    b_to_truth = {r.get("_b_id"): r.get("_b_source_a_id") for r in source_b}
+    true_orphan_b_ids = {bid for bid, src in b_to_truth.items() if src is None}
+
+    correct = 0
+    wrong = 0
+    pairs = reconciliation.get("matched_pairs") or []
+    matched_b_in_pred = set()
+    for p in pairs:
+        if not isinstance(p, dict):
+            continue
+        try:
+            a_id = int(p.get("a_id"))
+            b_id = int(p.get("b_id"))
+        except (TypeError, ValueError):
+            continue
+        matched_b_in_pred.add(b_id)
+        truth = b_to_truth.get(b_id)
+        if truth == a_id:
+            correct += 1
+        else:
+            wrong += 1
+
+    # Predicted orphans
+    pred_b_orphans = set()
+    for x in (reconciliation.get("b_orphans") or []):
+        try:
+            pred_b_orphans.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    true_b_orphans_caught = len(pred_b_orphans & true_orphan_b_ids)
+
+    total_real_matches = sum(1 for src in b_to_truth.values() if src is not None)
+    return {
+        "correct_matches": correct,
+        "wrong_matches": wrong,
+        "total_real_matches": total_real_matches,
+        "match_recall_pct": (correct / total_real_matches * 100) if total_real_matches else 0,
+        "b_orphans_caught": true_b_orphans_caught,
+        "total_real_b_orphans": len(true_orphan_b_ids),
+        "b_orphan_recall_pct": (true_b_orphans_caught / len(true_orphan_b_ids) * 100) if true_orphan_b_ids else 0,
+    }
+
 # ── Share/export helpers ──
 def export_json(data, results, city, model_name):
     payload = {
@@ -1357,7 +1595,37 @@ if data:
                     st.markdown(f"- {w}")
                 st.caption("Reduce the record count, or chunked tasks will retry next run with smaller batches.")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict"])
+        # ── Pipeline Merge demo button — simulates merging an acquired data feed ──
+        if "reconciliation" not in results:
+            with st.expander("🔀 **Pipeline Merge** — simulate acquiring a second data feed", expanded=False):
+                st.markdown(
+                    "Generates a synthetic *Source B* by perturbing the current records "
+                    "(realistic abbreviation swaps, casing variation, single-char typos, ±1 year_built, "
+                    "occasional missing zipcodes, plus ~15% dropped records and ~15% novel records). "
+                    "Then asks the model to reconcile A vs B — entity matching with conflict triage. "
+                    "This is the integration-day problem that an acquired pipeline creates."
+                )
+                if st.button("Run Pipeline Merge Demo", key="run_merge", use_container_width=True):
+                    try:
+                        client = anthropic.Anthropic(api_key=api_key)
+                        with st.spinner("Synthesizing Source B and reconciling…"):
+                            source_b, dropped_a, novel_b = synthesize_source_b(data, seed=42)
+                            reconciliation = run_reconciliation_task(client, data, source_b, model)
+                            score = score_reconciliation(reconciliation, source_b)
+                            results["reconciliation"] = {
+                                "source_b": source_b,
+                                "result": reconciliation,
+                                "score": score,
+                                "dropped_a_indices": dropped_a,
+                                "novel_b_ids": novel_b,
+                            }
+                            results["_usage"] = dict(st.session_state.get("_usage", {}))
+                            st.session_state["results"] = results
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Pipeline merge failed: {e}")
+
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict", "Pipeline Merge"])
 
         with tab1:
             if "addresses" in results:
@@ -1616,6 +1884,196 @@ if data:
                 )
             else:
                 st.warning("Verdict not available — run the evaluation to generate one.")
+
+        with tab5:
+            st.subheader("Pipeline Merge — Source A vs Source B Reconciliation")
+            recon_payload = results.get("reconciliation")
+            if not recon_payload:
+                st.caption(
+                    "Click the **Pipeline Merge** button above the tabs to simulate "
+                    "acquiring a second data feed for these properties and reconcile it "
+                    "against the current pipeline."
+                )
+            else:
+                recon = recon_payload.get("result") or {}
+                source_b = recon_payload.get("source_b") or []
+                score = recon_payload.get("score") or {}
+
+                st.caption(
+                    f"Source A: {len(data)} records (current pipeline). "
+                    f"Source B: {len(source_b)} records (synthesized acquired feed). "
+                    f"Seed: 42 — deterministic, reproducible."
+                )
+
+                pairs = recon.get("matched_pairs") or []
+                a_orphans = recon.get("a_orphans") or []
+                b_orphans = recon.get("b_orphans") or []
+
+                # Conflict severity breakdown across all matched pairs
+                sev_counts = {"trivial": 0, "minor": 0, "major": 0, "no_conflict": 0}
+                for p in pairs:
+                    confs = p.get("conflicts") or []
+                    if not confs:
+                        sev_counts["no_conflict"] += 1
+                        continue
+                    worst = "trivial"
+                    for c in confs:
+                        s = (c.get("severity") or "trivial").lower()
+                        if s == "major":
+                            worst = "major"
+                            break
+                        if s == "minor" and worst != "major":
+                            worst = "minor"
+                    sev_counts[worst] += 1
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Matched pairs", len(pairs))
+                m2.metric("A-orphans (in A, not in B)", len(a_orphans))
+                m3.metric("B-orphans (in B, not in A)", len(b_orphans))
+                if score:
+                    m4.metric(
+                        "Match accuracy",
+                        f"{score.get('correct_matches', 0)}/{score.get('total_real_matches', 0)}",
+                        f"{score.get('match_recall_pct', 0):.0f}% recall",
+                    )
+
+                # Triage-style disposition mapping
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("🟢 Auto-merge (clean)", sev_counts["no_conflict"])
+                d2.metric("🟢 Auto-merge (trivial)", sev_counts["trivial"])
+                d3.metric("🟡 Verify (minor)", sev_counts["minor"])
+                d4.metric("🔴 Hold (major)", sev_counts["major"])
+
+                summary_text = recon.get("summary", "")
+                if summary_text:
+                    st.info(f"**Summary:** {summary_text}")
+
+                if score:
+                    st.caption(
+                        f"Ground-truth scoring: {score.get('correct_matches', 0)} correct of "
+                        f"{score.get('total_real_matches', 0)} real matches "
+                        f"({score.get('match_recall_pct', 0):.0f}% recall, "
+                        f"{score.get('wrong_matches', 0)} wrong matches). "
+                        f"B-orphan detection: {score.get('b_orphans_caught', 0)} of "
+                        f"{score.get('total_real_b_orphans', 0)} "
+                        f"({score.get('b_orphan_recall_pct', 0):.0f}% recall)."
+                    )
+
+                # Build A and B lookup tables
+                a_by_id = {i + 1: r for i, r in enumerate(data)}
+                b_by_id = {r.get("_b_id"): r for r in source_b}
+
+                with st.expander(f"🟢 Auto-merge candidates ({sev_counts['no_conflict'] + sev_counts['trivial']})", expanded=False):
+                    rows = []
+                    for p in pairs:
+                        confs = p.get("conflicts") or []
+                        worst = "no_conflict" if not confs else min((c.get("severity", "trivial") for c in confs), key=lambda s: 0 if s == "trivial" else (1 if s == "minor" else 2))
+                        if confs and any((c.get("severity", "trivial") in ("minor", "major")) for c in confs):
+                            continue
+                        a_id, b_id = p.get("a_id"), p.get("b_id")
+                        a_rec = a_by_id.get(a_id, {})
+                        b_rec = b_by_id.get(b_id, {})
+                        rows.append({
+                            "A id": a_id, "B id": b_id,
+                            "A address": a_rec.get("address", ""),
+                            "B address": b_rec.get("address", ""),
+                            "conflicts": "; ".join(
+                                f"{c.get('field')}: '{c.get('a_value')}'→'{c.get('b_value')}'"
+                                for c in confs
+                            ) or "—",
+                        })
+                    if rows:
+                        st.dataframe(rows, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No auto-merge candidates.")
+
+                with st.expander(f"🟡 Verify (minor conflicts) ({sev_counts['minor']})", expanded=True):
+                    rows = []
+                    for p in pairs:
+                        confs = p.get("conflicts") or []
+                        if not confs:
+                            continue
+                        worst = "trivial"
+                        for c in confs:
+                            s = (c.get("severity") or "trivial").lower()
+                            if s == "major":
+                                worst = "major"
+                                break
+                            if s == "minor" and worst != "major":
+                                worst = "minor"
+                        if worst != "minor":
+                            continue
+                        a_id, b_id = p.get("a_id"), p.get("b_id")
+                        a_rec = a_by_id.get(a_id, {})
+                        b_rec = b_by_id.get(b_id, {})
+                        rows.append({
+                            "A id": a_id, "B id": b_id,
+                            "A address": a_rec.get("address", ""),
+                            "B address": b_rec.get("address", ""),
+                            "conflicts": "; ".join(
+                                f"{c.get('field')}: '{c.get('a_value')}' vs '{c.get('b_value')}' ({c.get('severity')})"
+                                for c in confs
+                            ),
+                        })
+                    if rows:
+                        st.dataframe(rows, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No verify-tier conflicts.")
+
+                with st.expander(f"🔴 Hold (major conflicts) ({sev_counts['major']})", expanded=True):
+                    rows = []
+                    for p in pairs:
+                        confs = p.get("conflicts") or []
+                        if not any((c.get("severity") or "").lower() == "major" for c in confs):
+                            continue
+                        a_id, b_id = p.get("a_id"), p.get("b_id")
+                        a_rec = a_by_id.get(a_id, {})
+                        b_rec = b_by_id.get(b_id, {})
+                        rows.append({
+                            "A id": a_id, "B id": b_id,
+                            "A address": a_rec.get("address", ""),
+                            "B address": b_rec.get("address", ""),
+                            "conflicts": "; ".join(
+                                f"{c.get('field')}: '{c.get('a_value')}' vs '{c.get('b_value')}' ({c.get('severity')})"
+                                for c in confs
+                            ),
+                        })
+                    if rows:
+                        st.dataframe(rows, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No major conflicts.")
+
+                col_a_orph, col_b_orph = st.columns(2)
+                with col_a_orph:
+                    with st.expander(f"⚪ A-orphans ({len(a_orphans)}) — in main pipeline, missing from acquired feed", expanded=False):
+                        rows = []
+                        for a_id in a_orphans:
+                            r = a_by_id.get(a_id, {})
+                            rows.append({
+                                "A id": a_id,
+                                "address": r.get("address", ""),
+                                "zipcode": r.get("zipcode", ""),
+                                "bldgclass": r.get("bldgclass", ""),
+                            })
+                        if rows:
+                            st.dataframe(rows, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No A-orphans.")
+                with col_b_orph:
+                    with st.expander(f"⚪ B-orphans ({len(b_orphans)}) — new properties from acquired feed", expanded=False):
+                        rows = []
+                        for b_id in b_orphans:
+                            r = b_by_id.get(b_id, {})
+                            rows.append({
+                                "B id": b_id,
+                                "address": r.get("address", ""),
+                                "zipcode": r.get("zipcode", ""),
+                                "bldgclass": r.get("bldgclass", ""),
+                            })
+                        if rows:
+                            st.dataframe(rows, use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No B-orphans.")
 
 elif source in ("NYC (PLUTO API)", "Vancouver (Open Data)", "Toronto (Open Data)"):
     st.info("Click **Fetch Data** in the sidebar to load property records.")
