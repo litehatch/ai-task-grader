@@ -1646,8 +1646,15 @@ if data:
                 st.caption("Reduce the record count, or chunked tasks will retry next run with smaller batches.")
 
         # ── Pipeline Merge demo button — simulates merging an acquired data feed ──
-        if "reconciliation" not in results:
-            with st.expander("🔀 **Pipeline Merge** — simulate acquiring a second data feed", expanded=False):
+        # Always rendered. Pre-run: shows the explainer + Run button.
+        # Post-run: shows inline headline metrics + summary, with a pointer to
+        # the Pipeline Merge tab for full evidence + a Re-run option.
+        _recon_payload = results.get("reconciliation")
+        with st.expander(
+            "🔀 **Pipeline Merge** — simulate acquiring a second data feed",
+            expanded=bool(_recon_payload),
+        ):
+            if not _recon_payload:
                 st.markdown(
                     "Generates a synthetic *Source B* by perturbing the current records "
                     "(realistic abbreviation swaps, casing variation, single-char typos, ±1 year_built, "
@@ -1675,6 +1682,65 @@ if data:
                     except Exception as e:
                         st.error(f"Pipeline merge failed: {type(e).__name__}: {e}")
                         st.caption("If this is the first run after a deploy, try once more — the model occasionally returns empty output on complex structured tasks and the retry path may help.")
+            else:
+                # Headline render — what an interviewer sees the moment the run completes.
+                _recon = _recon_payload.get("result") or {}
+                _source_b = _recon_payload.get("source_b") or []
+                _score = _recon_payload.get("score") or {}
+                _pairs = _recon.get("matched_pairs") or []
+                _a_orph = _recon.get("a_orphans") or []
+                _b_orph = _recon.get("b_orphans") or []
+
+                # Conflict severity breakdown
+                _sev = {"trivial": 0, "minor": 0, "major": 0, "no_conflict": 0}
+                for _p in _pairs:
+                    _confs = _p.get("conflicts") or []
+                    if not _confs:
+                        _sev["no_conflict"] += 1
+                        continue
+                    _worst = "trivial"
+                    for _c in _confs:
+                        _s = (_c.get("severity") or "trivial").lower()
+                        if _s == "major":
+                            _worst = "major"
+                            break
+                        if _s == "minor" and _worst != "major":
+                            _worst = "minor"
+                    _sev[_worst] += 1
+
+                st.caption(
+                    f"Source A: {len(data)} records (current pipeline). "
+                    f"Source B: {len(_source_b)} records (synthesized acquired feed). "
+                    f"Seed: 42 — deterministic, reproducible."
+                )
+
+                _m1, _m2, _m3, _m4 = st.columns(4)
+                _m1.metric("Matched pairs", len(_pairs))
+                _m2.metric("A-orphans", len(_a_orph))
+                _m3.metric("B-orphans", len(_b_orph))
+                if _score:
+                    _m4.metric(
+                        "Match recall",
+                        f"{_score.get('match_recall_pct', 0):.0f}%",
+                        f"{_score.get('correct_matches', 0)}/{_score.get('total_real_matches', 0)} correct",
+                    )
+
+                _d1, _d2, _d3, _d4 = st.columns(4)
+                _d1.metric("🟢 Auto-merge", _sev["no_conflict"] + _sev["trivial"])
+                _d2.metric("🟡 Verify", _sev["minor"])
+                _d3.metric("🔴 Hold", _sev["major"])
+                _d4.metric("Total to triage", len(_pairs))
+
+                _summary = _recon.get("summary", "")
+                if _summary:
+                    st.info(f"**Summary:** {_summary}")
+
+                st.caption("↓ Full evidence — matched pairs with conflicts, A-orphans, B-orphans — in the **Pipeline Merge** tab below.")
+
+                if st.button("Re-run Pipeline Merge", key="rerun_merge"):
+                    results.pop("reconciliation", None)
+                    st.session_state["results"] = results
+                    st.rerun()
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs(["Addresses", "Classifications", "Data Quality", "Verdict", "Pipeline Merge"])
 
