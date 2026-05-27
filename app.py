@@ -422,6 +422,19 @@ def parse_json_response(text):
             return parsed
         except json.JSONDecodeError:
             pass
+        # Model may have prepended a prose preamble ("Here is the JSON:\n{...}")
+        # despite the system prompt. Scan forward to the first { or [ and retry
+        # raw_decode from there.
+        first_obj = text.find("{")
+        first_arr = text.find("[")
+        candidates = [p for p in (first_obj, first_arr) if p > 0]
+        if candidates:
+            start = min(candidates)
+            try:
+                parsed, _end = json.JSONDecoder().raw_decode(text[start:])
+                return parsed
+            except json.JSONDecodeError:
+                pass
         if text.startswith("["):
             # Trim back to the last complete top-level object, then close the array.
             depth = 0
